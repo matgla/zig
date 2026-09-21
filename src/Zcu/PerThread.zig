@@ -387,6 +387,10 @@ fn workerUpdateFile(
         .zon => return, // ZON can't import anything so we're done
     }
 
+    // Without incremental compilation, file imports are loaded on demand by `lazyImportFile`
+    // when semantic analysis first resolves them, so only what is actually used gets lowered.
+    if (!comp.config.incremental) return;
+
     // Discover all imports in the file. Imports of modules we ignore for now since we don't
     // know which module we're in, but imports of file paths might need us to queue up other
     // AstGen jobs.
@@ -2401,6 +2405,8 @@ pub fn doImport(
     OutOfMemory,
     ModuleNotFound,
     IllegalZigImport,
+    /// The file path has not been loaded yet; see `lazyImportFile`.
+    NotLoaded,
 }!struct {
     file: Zcu.File.Index,
     module_root: ?*Module,
@@ -2434,10 +2440,116 @@ pub fn doImport(
     if (try path.isIllegalZigImport(gpa, zcu.comp.dirs)) {
         return error.IllegalZigImport;
     }
-    return .{
-        .file = zcu.import_table.getKeyAdapted(path, Zcu.ImportTableAdapter{ .zcu = zcu }).?,
-        .module_root = null,
+    const file_index = zcu.import_table.getKeyAdapted(path, Zcu.ImportTableAdapter{ .zcu = zcu }) orelse {
+        assert(!zcu.comp.config.incremental); // otherwise AstGen discovered every import
+        return error.NotLoaded;
     };
+    return .{ .file = file_index, .module_root = null };
+}
+
+/// Loads a file on its first `@import` when compiling without incremental compilation, doing
+/// the work `workerUpdateFile` and `computeAliveFiles` do up front in incremental mode.
+/// `error.ImportFailed` means the reason is already recorded as a file error.
+pub fn lazyImportFile(
+    pt: Zcu.PerThread,
+    importer_index: Zcu.File.Index,
+    import_string: []const u8,
+) (Allocator.Error || Io.Cancelable || error{ ImportFailed, FileOutsideModuleRoot })!Zcu.File.Index {
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const gpa = comp.gpa;
+    const io = comp.io;
+    assert(!comp.config.incremental);
+    const importer = zcu.fileByIndex(importer_index);
+
+    const new = switch (try pt.discoverImport(importer.path, import_string)) {
+        .module => unreachable, // `doImport` only reports `NotLoaded` for file paths
+        .existing_file => |file_index| {
+            // An earlier attempt created the entry; it is only usable if that attempt succeeded.
+            if (zcu.fileByIndex(file_index).status != .success) return error.ImportFailed;
+            return file_index;
+        },
+        .new_file => |new| new,
+    };
+    const file = new.file;
+
+    const importer_mod = importer.mod.?;
+    switch (file.path.isNested(importer_mod.root)) {
+        .yes => |sub_path| {
+            file.mod = importer_mod;
+            file.sub_file_path = sub_path;
+        },
+        .different_roots, .no => {
+            file.status = .retryable_failure;
+            return error.FileOutsideModuleRoot;
+        },
+    }
+
+    // Error reporting only considers alive files, so register it before anything can fail.
+    const import_tok: Ast.TokenIndex = tok: {
+        const zir = importer.zir.?;
+        const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
+        const extra = zir.extraData(Zir.Inst.Imports, imports_index);
+        var extra_index = extra.end;
+        for (0..extra.data.imports_len) |_| {
+            const item = zir.extraData(Zir.Inst.Imports.Item, extra_index);
+            extra_index = item.end;
+            if (mem.eql(u8, zir.nullTerminatedString(item.data.name), import_string)) break :tok item.data.token;
+        }
+        unreachable; // AstGen records every `@import` operand
+    };
+    try zcu.alive_files.put(gpa, new.index, .{ .import = .{
+        .importer = importer_index,
+        .tok = import_tok,
+        .module = null,
+    } });
+    try comp.appendFileSystemInput(file.path);
+
+    pt.updateFile(new.index, file) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Canceled) return error.Canceled;
+        try pt.reportRetryableFileError(new.index, "unable to load '{s}': {s}", .{
+            std.fs.path.basename(file.path.sub_path), @errorName(err),
+        });
+        return error.ImportFailed;
+    };
+
+    // Every input must be in the cache manifest, or editing it would not invalidate the cache.
+    switch (comp.cache_use) {
+        .whole => |whole| if (whole.cache_manifest) |man| {
+            const path = try file.path.toAbsolute(comp.dirs, gpa);
+            defer gpa.free(path);
+            try whole.cache_manifest_mutex.lock(io);
+            defer whole.cache_manifest_mutex.unlock(io);
+            man.addFilePost(path) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => {
+                    try pt.reportRetryableFileError(new.index, "unable to update cache: {s}", .{@errorName(err)});
+                    return error.ImportFailed;
+                },
+            };
+        },
+        .none, .incremental => {},
+    }
+
+    if (file.status != .success) return error.ImportFailed;
+    if (file.getMode() == .zig) {
+        // `builtin` modules are otherwise created by `computeAliveFiles` before analysis.
+        const zir = file.zir.?;
+        const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
+        if (imports_index != 0) {
+            const extra = zir.extraData(Zir.Inst.Imports, imports_index);
+            var extra_index = extra.end;
+            for (0..extra.data.imports_len) |_| {
+                const item = zir.extraData(Zir.Inst.Imports.Item, extra_index);
+                extra_index = item.end;
+                if (mem.eql(u8, zir.nullTerminatedString(item.data.name), "builtin")) {
+                    try pt.updateBuiltinModule(file.mod.?.getBuiltinOptions(comp.config));
+                }
+            }
+        }
+    }
+    return new.index;
 }
 /// This is called once during `Compilation.create` and never again. "builtin" modules don't yet
 /// exist, so are not added to `module_roots` here. They must be added when they are created.
@@ -2618,8 +2730,13 @@ fn computeAliveFiles(pt: Zcu.PerThread) Allocator.Error!bool {
                 continue;
             }
 
+            if (!comp.config.incremental and Zcu.File.modeFromPath(import_path) != null) {
+                continue; // loaded by `lazyImportFile` if semantic analysis reaches it
+            }
+
             const res = pt.doImport(file, import_path) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
+                error.NotLoaded => unreachable, // file imports are skipped above when lazy
                 error.ModuleNotFound => {
                     // It'd be nice if this were a file-level error, but allowing this turns out to
                     // be quite important in practice, e.g. for optional dependencies whose import

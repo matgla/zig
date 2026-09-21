@@ -12907,14 +12907,19 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.
     const operand_src = block.tokenOffset(inst_data.src_tok);
     const operand = sema.code.nullTerminatedString(extra.path);
 
-    const result = pt.doImport(block.getFileScope(zcu), operand) catch |err| switch (err) {
+    const file_index: Zcu.File.Index = if (pt.doImport(block.getFileScope(zcu), operand)) |result| result.file else |err| switch (err) {
         error.ModuleNotFound => return sema.fail(block, operand_src, "no module named '{s}' available within module '{s}'", .{
             operand, block.getFileScope(zcu).mod.?.fully_qualified_name,
         }),
-        error.IllegalZigImport => unreachable, // caught before semantic analysis
+        // Caught before semantic analysis, except in files loaded lazily.
+        error.IllegalZigImport => return sema.fail(block, operand_src, "illegal import '{s}'", .{operand}),
         error.OutOfMemory => |e| return e,
+        error.NotLoaded => pt.lazyImportFile(block.getFileScopeIndex(zcu), operand) catch |lazy_err| switch (lazy_err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            error.ImportFailed => return sema.fail(block, operand_src, "unable to import '{s}'", .{operand}),
+            error.FileOutsideModuleRoot => return sema.fail(block, operand_src, "import of file outside module path: '{s}'", .{operand}),
+        },
     };
-    const file_index = result.file;
     const file = zcu.fileByIndex(file_index);
     try sema.declareDependency(.{ .source_file = file_index });
     switch (file.getMode()) {
