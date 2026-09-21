@@ -2551,8 +2551,13 @@ pub fn genDeclValue(dg: *DeclGen, w: *Writer, options: struct {
         try w.writeAll("zig_threadlocal ");
     }
     try dg.renderTypeAndName(w, ty, options.name, .{ .@"const" = options.@"const" }, .none);
-    try w.writeAll(" = ");
-    try dg.renderValue(w, options.init_val, .static_initializer);
+    // A wholly-undefined mutable global needs no initializer: C zero-initialises it,
+    // which is a valid `undefined`, and it lands in .bss instead of spelling out 0xAA
+    // filler (a 256 KiB `[N]u8 = undefined` otherwise becomes ~1.8 MB of C and .data).
+    if (!(options.init_val.isUndef(zcu) and !options.@"const")) {
+        try w.writeAll(" = ");
+        try dg.renderValue(w, options.init_val, .static_initializer);
+    }
     try w.writeByte(';');
     if (dg.owner_nav.unwrap()) |nav_index| {
         const ip = &zcu.intern_pool;
