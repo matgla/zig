@@ -705,6 +705,13 @@ pub fn updateFile(
             } else {
                 file.status = .success;
             }
+            // Once ZIR exists, source and AST are only needed to render compile errors, and
+            // `File.getSource`/`File.getTree` reload them on demand. Keeping them resident for
+            // every file in the import graph roughly doubles peak memory on a cold ZIR cache.
+            if (!file.zir.?.hasCompileErrors()) {
+                file.unloadTree(gpa);
+                file.unloadSource(gpa);
+            }
         },
         .zon => {
             if (file.zoir.?.hasCompileErrors()) {
