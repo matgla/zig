@@ -166,8 +166,65 @@ var safe_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{
     .stack_trace_frames = build_options.mem_leak_frames,
 });
 
+/// Measurement only, enabled by `-Dpeak-heap`: wraps the root allocator to record
+/// peak live heap bytes and reports them at exit. Needs libc for `atexit`, so it
+/// stays inert in a freestanding build.
+const track_peak_heap = build_options.peak_heap and builtin.link_libc;
+
+const PeakTracker = struct {
+    child: Allocator,
+    cur: usize = 0,
+    peak: usize = 0,
+    count: usize = 0,
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *PeakTracker) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn note(self: *PeakTracker, add: usize, sub: usize) void {
+        self.cur += add;
+        self.cur -= @min(sub, self.cur);
+        if (self.cur > self.peak) self.peak = self.cur;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        self.count += 1;
+        self.note(len, 0);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, a, new_len, ra)) return false;
+        self.note(new_len, memory.len);
+        return true;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawRemap(memory, a, new_len, ra) orelse return null;
+        self.note(new_len, memory.len);
+        return p;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, a, ra);
+        self.note(0, memory.len);
+    }
+};
+
+var peak_tracker: if (track_peak_heap) PeakTracker else void = undefined;
+
+extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
+
+fn reportPeak() callconv(.c) void {
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "PEAK_HEAP {d} allocs {d}\n", .{ peak_tracker.peak, peak_tracker.count }) catch return;
+    _ = std.c.write(2, msg.ptr, msg.len);
+}
+
 pub fn main(init: std.process.Init.Minimal) anyerror!void {
-    const root_gpa = if (use_safe_allocator)
+    const unwrapped_gpa = if (use_safe_allocator)
         safe_allocator.allocator()
     else if (native_os == .wasi)
         std.heap.wasm_allocator
@@ -175,6 +232,11 @@ pub fn main(init: std.process.Init.Minimal) anyerror!void {
         std.heap.c_allocator
     else
         std.heap.smp_allocator;
+    const root_gpa = if (track_peak_heap) gpa: {
+        peak_tracker = .{ .child = unwrapped_gpa };
+        _ = atexit(reportPeak);
+        break :gpa peak_tracker.allocator();
+    } else unwrapped_gpa;
     defer if (use_safe_allocator) {
         _ = safe_allocator.deinit();
     };
