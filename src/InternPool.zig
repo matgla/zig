@@ -6462,6 +6462,25 @@ pub const census = struct {
                 live += @field(local.shared, name).bufferBytes();
             }
         }
+        // Every file whose ZIR is still loaded. Nothing drops ZIR today -- `unloadZir`
+        // has only teardown callers -- so this is the whole evictable set, and the
+        // question Stage C2 turns on: how much of peak is ZIR just sitting there.
+        var zir_files: usize = 0;
+        var zir_bytes: usize = 0;
+        var src_bytes: usize = 0;
+        for (ip.locals) |*local| {
+            const len = local.mutate.files.len;
+            if (len == 0) continue;
+            for (local.shared.files.view().items(.file)[0..len]) |f| {
+                const zir = f.zir orelse continue;
+                zir_files += 1;
+                zir_bytes += zir.instructions.len * (1 + @sizeOf(Zir.Inst.Data)) +
+                    zir.extra.len * @sizeOf(u32) + zir.string_bytes.len;
+                if (f.source) |src| src_bytes += src.len;
+            }
+        }
+        std.debug.print("ZIR_LIVE files {d} bytes {d} src {d}\n", .{ zir_files, zir_bytes, src_bytes });
+
         // Each entry of the `maps` list is a hash map that owns its storage outside the
         // flat lists above: one per struct/union/enum/error-set type, sized to that type's
         // field count. A one-name `error{X}` gets a whole map.
