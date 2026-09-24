@@ -1918,6 +1918,11 @@ pub const NullTerminatedString = enum(u32) {
         return @backingInt(a) < @backingInt(b);
     }
 
+    /// `indexLessThan` as a three-way comparison, for searching a sorted run.
+    pub fn indexOrder(key: NullTerminatedString, mid: NullTerminatedString) std.math.Order {
+        return std.math.order(@backingInt(key), @backingInt(mid));
+    }
+
     pub fn toUnsigned(string: NullTerminatedString, ip: *const InternPool) ?u32 {
         const slice = string.toSlice(ip);
         if (slice.len > 1 and slice[0] == '0') return null;
@@ -2093,14 +2098,22 @@ pub const Key = union(enum) {
     pub const ErrorSetType = struct {
         /// Set of error names, sorted by null terminated string index.
         names: NullTerminatedString.Slice,
-        /// This is ignored by `get` but will always be provided by `indexToKey`.
-        names_map: OptionalMapIndex = .none,
 
         /// Look up field index based on field name.
+        ///
+        /// `names` is sorted by `NullTerminatedString.indexLessThan` (both constructors
+        /// assert it) and the hash map this used to consult compared names by integer
+        /// value alone, so a binary search answers exactly the same question without a
+        /// map per error set -- and `error{X}` is by far the most common error set there
+        /// is.
         pub fn nameIndex(self: ErrorSetType, ip: *const InternPool, name: NullTerminatedString) ?u32 {
-            const map = self.names_map.unwrap().?.get(ip);
-            const adapter: NullTerminatedString.Adapter = .{ .strings = self.names.get(ip) };
-            const field_index = map.getIndexAdapted(name, adapter) orelse return null;
+            const names = self.names.get(ip);
+            const field_index = std.sort.binarySearch(
+                NullTerminatedString,
+                names,
+                name,
+                NullTerminatedString.indexOrder,
+            ) orelse return null;
             return @intCast(field_index);
         }
     };
@@ -5542,8 +5555,6 @@ pub const Tag = enum(u8) {
     /// 0. name: NullTerminatedString for each names_len
     pub const ErrorSet = struct {
         names_len: u32,
-        /// Maps error names to declaration index.
-        names_map: MapIndex,
     };
 
     /// Trailing:
@@ -6451,12 +6462,26 @@ pub const census = struct {
                 live += @field(local.shared, name).bufferBytes();
             }
         }
+        // Each entry of the `maps` list is a hash map that owns its storage outside the
+        // flat lists above: one per struct/union/enum/error-set type, sized to that type's
+        // field count. A one-name `error{X}` gets a whole map.
+        var field_maps: usize = 0;
+        var field_map_entries: usize = 0;
+        for (ip.locals) |*local| {
+            const len = local.mutate.maps.len;
+            if (len == 0) continue;
+            field_maps += len;
+            for (local.shared.maps.view().items(.@"0")[0..len]) |*m| {
+                field_map_entries += m.capacity();
+            }
+        }
         var maps: usize = 0;
         for (ip.shards) |*shard| {
             maps += shard.shared.map.tableBytes();
             maps += shard.shared.string_map.tableBytes();
             maps += shard.shared.tracked_inst_map.tableBytes();
         }
+        std.debug.print("IP_FIELDMAPS {d} entries {d}\n", .{ field_maps, field_map_entries });
         std.debug.print("IP_ARENA {d} IP_LIVE {d} IP_RETIRED {d} IP_MAPS {d} IP_RMAPS {d} IP_SLACK {d}\n", .{
             arena,     live,           retired_lists, maps,       retired_maps,
             arena -| live -| retired_lists -| maps -| retired_maps,
@@ -7037,7 +7062,6 @@ fn extraErrorSet(tid: Zcu.PerThread.Id, extra: Local.Extra, extra_index: u32) Ke
             .start = @intCast(error_set.end),
             .len = error_set.data.names_len,
         },
-        .names_map = error_set.data.names_map.toOptional(),
     };
 }
 
@@ -7452,18 +7476,13 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
             });
         },
         .error_set_type => |error_set_type| {
-            assert(error_set_type.names_map == .none);
             assert(std.sort.isSorted(NullTerminatedString, error_set_type.names.get(ip), {}, NullTerminatedString.indexLessThan));
-            const names = error_set_type.names.get(ip);
-            const names_map = try ip.addMap(gpa, io, tid, names.len);
-            ip.addStringsToMap(names_map, names);
             const names_len = error_set_type.names.len;
             try extra.ensureUnusedCapacity(@typeInfo(Tag.ErrorSet).@"struct".field_names.len + names_len);
             items.appendAssumeCapacity(.{
                 .tag = .type_error_set,
                 .data = addExtraAssumeCapacity(extra, Tag.ErrorSet{
                     .names_len = names_len,
-                    .names_map = names_map,
                 }),
             });
             extra.appendSliceAssumeCapacity(.{@ptrCast(error_set_type.names.get(ip))});
@@ -9558,9 +9577,6 @@ pub fn getErrorSetType(
     const extra = local.getMutableExtra(gpa, io);
     try extra.ensureUnusedCapacity(@typeInfo(Tag.ErrorSet).@"struct".field_names.len + names.len);
 
-    const names_map = try ip.addMap(gpa, io, tid, names.len);
-    errdefer local.mutate.maps.len -= 1;
-
     // The strategy here is to add the type unconditionally, then to ask if it
     // already exists, and if so, revert the lengths of the mutated arrays.
     // This is similar to what `getOrPutTrailingString` does.
@@ -9569,7 +9585,6 @@ pub fn getErrorSetType(
 
     const error_set_extra_index = addExtraAssumeCapacity(extra, Tag.ErrorSet{
         .names_len = @intCast(names.len),
-        .names_map = names_map,
     });
     extra.appendSliceAssumeCapacity(.{@ptrCast(names)});
     errdefer extra.mutate.len = prev_extra_len;
@@ -9588,8 +9603,6 @@ pub fn getErrorSetType(
         .data = error_set_extra_index,
     });
     errdefer items.mutate.len -= 1;
-
-    ip.addStringsToMap(names_map, names);
 
     return gop.put();
 }
