@@ -279,13 +279,11 @@ pub fn trackZir(
         entry.release(index.toOptional());
         return index;
     }
-    const arena_state = &local.mutate.arena;
-    var arena = arena_state.promote(gpa);
-    defer arena_state.* = arena.state;
     const new_map_capacity = map_header.capacity * 2;
-    const new_map_buf = try arena.allocator().alignedAlloc(
-        u8,
-        .fromByteUnits(Map.alignment),
+    if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+    const new_map_buf = try local.poolAlloc(
+        gpa,
+        Map.alignment,
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
@@ -358,7 +356,7 @@ pub fn rehashTrackedInsts(
 
     const Map = Shard.Map(TrackedInst.Index.Optional);
 
-    const arena_state = &ip.getLocal(tid).mutate.arena;
+    const owner_local = ip.getLocal(tid);
 
     // We know how big each shard must be, so ensure we have the capacity we need.
     for (ip.shards) |*shard| {
@@ -377,11 +375,10 @@ pub fn rehashTrackedInsts(
             }
             continue;
         }
-        var arena = arena_state.promote(gpa);
-        defer arena_state.* = arena.state;
-        const new_map_buf = try arena.allocator().alignedAlloc(
-            u8,
-            .fromByteUnits(Map.alignment),
+        if (build_options.peak_heap) census.retired_maps += shard.shared.tracked_inst_map.tableBytes();
+        const new_map_buf = try owner_local.poolAlloc(
+            gpa,
+            Map.alignment,
             Map.entries_offset + want_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
@@ -972,7 +969,15 @@ const Local = struct {
         /// so it must remain valid.
         /// This arena's lifetime is tied to that of `Compilation`, although it can be cleared on
         /// garbage collection (currently vaporware).
+        /// Unused in single-threaded builds; see `owned`.
         arena: std.heap.ArenaAllocator.State,
+        /// A single-threaded build has no GPA contention to avoid, so it takes those buffers
+        /// straight from the GPA and records them here instead, releasing the lot at teardown.
+        /// The retention guarantee above is unchanged -- nothing is freed early, because callers
+        /// legitimately hold slices into superseded storage across further interning (see the
+        /// `field_types`/`field_offsets` loop in `codegen.zig`). What this drops is the arena's
+        /// node growth, which stranded 24-42% of everything it handed out.
+        owned: if (single_threaded) Owned else void,
 
         items: ListMutate,
         extra: ListMutate,
@@ -1062,7 +1067,7 @@ const Local = struct {
             const Mutable = struct {
                 gpa: Allocator,
                 io: Io,
-                arena: *std.heap.ArenaAllocator.State,
+                local: *Local,
                 mutate: *ListMutate,
                 list: *ListSelf,
 
@@ -1210,11 +1215,10 @@ const Local = struct {
 
                 fn setCapacity(mutable: Mutable, capacity: u32) Allocator.Error!void {
                     const io = mutable.io;
-                    var arena = mutable.arena.promote(mutable.gpa);
-                    defer mutable.arena.* = arena.state;
-                    const buf = try arena.allocator().alignedAlloc(
-                        u8,
-                        .fromByteUnits(alignment),
+                    if (build_options.peak_heap) census.retired_lists += mutable.list.bufferBytes();
+                    const buf = try mutable.local.poolAlloc(
+                        mutable.gpa,
+                        alignment,
                         bytes_offset + View.capacityInBytes(capacity),
                     );
                     var new_list: ListSelf = .{ .bytes = @ptrCast(buf[bytes_offset..].ptr) };
@@ -1277,6 +1281,13 @@ const Local = struct {
             fn header(list: ListSelf) *Header {
                 return @ptrCast(@alignCast(list.bytes - bytes_offset));
             }
+            /// Bytes this list's current buffer occupies, 0 for the static empty
+            /// sentinel. Used by the `-Dpeak-heap` census.
+            pub fn bufferBytes(list: ListSelf) usize {
+                const capacity = list.header().capacity;
+                if (capacity == 0) return 0;
+                return bytes_offset + View.capacityInBytes(capacity);
+            }
             pub fn view(list: ListSelf) View {
                 const capacity = list.header().capacity;
                 assert(capacity > 0); // optimizes `MultiArrayList.Slice.items`
@@ -1289,11 +1300,53 @@ const Local = struct {
         };
     }
 
+    const OwnedBuf = struct {
+        ptr: [*]u8,
+        len: usize,
+        alignment: std.mem.Alignment,
+    };
+    const Owned = std.ArrayListUnmanaged(OwnedBuf);
+
+    /// Long-lived `InternPool` storage: from the GPA and remembered when single-threaded,
+    /// from `arena` otherwise. Never reused or freed before teardown either way.
+    fn poolAlloc(
+        local: *Local,
+        gpa: Allocator,
+        comptime buf_alignment: usize,
+        n: usize,
+    ) Allocator.Error![]align(buf_alignment) u8 {
+        if (!single_threaded) {
+            var arena = local.mutate.arena.promote(gpa);
+            defer local.mutate.arena = arena.state;
+            return arena.allocator().alignedAlloc(u8, .fromByteUnits(buf_alignment), n);
+        }
+        try local.mutate.owned.ensureUnusedCapacity(gpa, 1);
+        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(buf_alignment), n);
+        local.mutate.owned.appendAssumeCapacity(.{
+            .ptr = buf.ptr,
+            .len = buf.len,
+            .alignment = .fromByteUnits(buf_alignment),
+        });
+        return buf;
+    }
+
+    /// Releases everything `poolAlloc` handed out. Call once, at teardown.
+    fn poolFree(local: *Local, gpa: Allocator) void {
+        if (!single_threaded) {
+            local.mutate.arena.promote(gpa).deinit();
+            return;
+        }
+        for (local.mutate.owned.items) |buf| {
+            gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+        }
+        local.mutate.owned.deinit(gpa);
+    }
+
     pub fn getMutableItems(local: *Local, gpa: Allocator, io: Io) List(Item).Mutable {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.items,
             .list = &local.shared.items,
         };
@@ -1303,7 +1356,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.extra,
             .list = &local.shared.extra,
         };
@@ -1319,7 +1372,7 @@ const Local = struct {
             @sizeOf(u64) => .{
                 .gpa = gpa,
                 .io = io,
-                .arena = &local.mutate.arena,
+                .local = local,
                 .mutate = &local.mutate.limbs,
                 .list = &local.shared.limbs,
             },
@@ -1332,7 +1385,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.strings,
             .list = &local.shared.strings,
         };
@@ -1347,7 +1400,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.string_bytes,
             .list = &local.shared.string_bytes,
         };
@@ -1359,7 +1412,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.tracked_insts,
             .list = &local.shared.tracked_insts,
         };
@@ -1376,7 +1429,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.files,
             .list = &local.shared.files,
         };
@@ -1391,7 +1444,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.maps,
             .list = &local.shared.maps,
         };
@@ -1401,7 +1454,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.navs,
             .list = &local.shared.navs,
         };
@@ -1411,7 +1464,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.comptime_units,
             .list = &local.shared.comptime_units,
         };
@@ -1431,7 +1484,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.namespaces.buckets_list,
             .list = &local.shared.namespaces,
         };
@@ -1558,6 +1611,10 @@ const Shard = struct {
             };
             fn header(map: @This()) *Header {
                 return @ptrCast(@alignCast(@as([*]u8, @ptrCast(map.entries)) - entries_offset));
+            }
+            /// Bytes this map's current table occupies. Used by the `-Dpeak-heap` census.
+            pub fn tableBytes(map: @This()) usize {
+                return entries_offset + map.header().capacity * @sizeOf(Entry);
             }
 
             const Entry = extern struct {
@@ -6309,6 +6366,7 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
         },
         .mutate = .{
             .arena = .{},
+            .owned = if (single_threaded) .empty else {},
 
             .items = .empty,
             .extra = .empty,
@@ -6325,6 +6383,8 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
         },
     });
     for (ip.locals) |*local| try local.getMutableStrings(gpa, io).append(.{0});
+
+    if (build_options.peak_heap) census.note(ip, gpa);
 
     ip.tid_width = @intCast(std.math.log2_int_ceil(usize, used_threads));
     ip.tid_shift_30 = if (single_threaded) 0 else 30 - ip.tid_width;
@@ -6363,6 +6423,46 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
         assert(ip.indexToKey(.bool_false).simple_value == .false);
     }
 }
+
+/// `-Dpeak-heap` census of the per-thread arenas: how much is live list storage and how
+/// much is buffers retained by `setCapacity` after a growth (see the comment on
+/// `Local.mutate.arena`). Reported from the same `atexit` hook as PEAK_HEAP, because a
+/// one-shot compile leaves through `cleanExit` and never tears the pool down.
+pub const census = struct {
+    var pool: ?*const InternPool = null;
+    var pool_gpa: Allocator = undefined;
+    /// Bytes handed to `setCapacity`'s predecessors: dead list storage the arena keeps.
+    pub var retired_lists: usize = 0;
+    /// Same, for shard map tables superseded by a rehash.
+    pub var retired_maps: usize = 0;
+
+    pub fn note(ip: *const InternPool, gpa: Allocator) void {
+        pool = ip;
+        pool_gpa = gpa;
+    }
+
+    pub fn report() void {
+        const ip = pool orelse return;
+        var arena: usize = 0;
+        var live: usize = 0;
+        for (ip.locals) |*local| {
+            arena += local.mutate.arena.promote(pool_gpa).queryCapacity();
+            inline for (@typeInfo(Local.Shared).@"struct".field_names) |name| {
+                live += @field(local.shared, name).bufferBytes();
+            }
+        }
+        var maps: usize = 0;
+        for (ip.shards) |*shard| {
+            maps += shard.shared.map.tableBytes();
+            maps += shard.shared.string_map.tableBytes();
+            maps += shard.shared.tracked_inst_map.tableBytes();
+        }
+        std.debug.print("IP_ARENA {d} IP_LIVE {d} IP_RETIRED {d} IP_MAPS {d} IP_RMAPS {d} IP_SLACK {d}\n", .{
+            arena,     live,           retired_lists, maps,       retired_maps,
+            arena -| live -| retired_lists -| maps -| retired_maps,
+        });
+    }
+};
 
 pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
     std.debug.assert(debug_state.intern_pool == null);
@@ -6403,7 +6503,7 @@ pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
         };
         const maps = local.getMutableMaps(gpa, io);
         if (maps.mutate.len > 0) for (maps.view().items(.@"0")) |*map| map.deinit(gpa);
-        local.mutate.arena.promote(gpa).deinit();
+        local.poolFree(gpa);
     }
     gpa.free(ip.locals);
 
@@ -7192,17 +7292,16 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     const map_header = map.header().*;
     const required = shard.mutate.map.len + additional_capacity;
     if (required >= map_header.capacity * 3 / 5) {
-        const arena_state = &ip.getLocal(tid).mutate.arena;
-        var arena = arena_state.promote(gpa);
-        defer arena_state.* = arena.state;
+        const local = ip.getLocal(tid);
         var new_map_capacity = map_header.capacity;
         while (true) {
             new_map_capacity *= 2;
             if (required < new_map_capacity * 3 / 5) break;
         }
-        const new_map_buf = try arena.allocator().alignedAlloc(
-            u8,
-            .fromByteUnits(Map.alignment),
+        if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+        const new_map_buf = try local.poolAlloc(
+            gpa,
+            Map.alignment,
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
@@ -11283,11 +11382,13 @@ pub fn createNamespace(
     const last_bucket_len = local.mutate.namespaces.last_bucket_len & Local.namespaces_bucket_mask;
     if (last_bucket_len == 0) {
         try namespaces.ensureUnusedCapacity(1);
-        var arena = namespaces.arena.promote(namespaces.gpa);
-        defer namespaces.arena.* = arena.state;
-        namespaces.appendAssumeCapacity(.{try arena.allocator().create(
-            [1 << Local.namespaces_bucket_width]Zcu.Namespace,
-        )});
+        const Bucket = [1 << Local.namespaces_bucket_width]Zcu.Namespace;
+        const bucket_buf = try namespaces.local.poolAlloc(
+            namespaces.gpa,
+            @alignOf(Bucket),
+            @sizeOf(Bucket),
+        );
+        namespaces.appendAssumeCapacity(.{@ptrCast(bucket_buf.ptr)});
     }
     const unwrapped_namespace_index: NamespaceIndex.Unwrapped = .{
         .tid = tid,
@@ -11480,13 +11581,11 @@ pub fn getOrPutTrailingString(
         entry.release(@fromBackingInt(@intCast(@backingInt(value))));
         return value;
     }
-    const arena_state = &local.mutate.arena;
-    var arena = arena_state.promote(gpa);
-    defer arena_state.* = arena.state;
     const new_map_capacity = map_header.capacity * 2;
-    const new_map_buf = try arena.allocator().alignedAlloc(
-        u8,
-        .fromByteUnits(Map.alignment),
+    if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+    const new_map_buf = try local.poolAlloc(
+        gpa,
+        Map.alignment,
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
@@ -12388,7 +12487,7 @@ const GlobalErrorSet = struct {
         ges: *GlobalErrorSet,
         gpa: Allocator,
         io: Io,
-        arena_state: *std.heap.ArenaAllocator.State,
+        local: *Local,
         name: NullTerminatedString,
     ) Allocator.Error!GlobalErrorSet.Index {
         if (name == .empty) return .none;
@@ -12424,7 +12523,7 @@ const GlobalErrorSet = struct {
         const mutable_names: Names.Mutable = .{
             .gpa = gpa,
             .io = io,
-            .arena = arena_state,
+            .local = local,
             .mutate = &ges.mutate.names,
             .list = &ges.shared.names,
         };
@@ -12438,12 +12537,11 @@ const GlobalErrorSet = struct {
             entry.release(index);
             return index;
         }
-        var arena = arena_state.promote(gpa);
-        defer arena_state.* = arena.state;
         const new_map_capacity = map_header.capacity * 2;
-        const new_map_buf = try arena.allocator().alignedAlloc(
-            u8,
-            .fromByteUnits(Map.alignment),
+        if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+        const new_map_buf = try local.poolAlloc(
+            gpa,
+            Map.alignment,
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
@@ -12509,7 +12607,7 @@ pub fn getErrorValue(
     tid: Zcu.PerThread.Id,
     name: NullTerminatedString,
 ) Allocator.Error!Zcu.ErrorInt {
-    return @backingInt(try ip.global_error_set.getErrorValue(gpa, io, &ip.getLocal(tid).mutate.arena, name));
+    return @backingInt(try ip.global_error_set.getErrorValue(gpa, io, ip.getLocal(tid), name));
 }
 
 pub fn getErrorValueIfExists(ip: *const InternPool, name: NullTerminatedString) ?Zcu.ErrorInt {

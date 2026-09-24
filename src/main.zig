@@ -33,6 +33,7 @@ const Zcu = @import("Zcu.zig");
 const mingw = @import("libs/mingw.zig");
 const dev = @import("dev.zig");
 const Module = @import("Module.zig");
+const InternPool = @import("InternPool.zig");
 
 test {
     _ = @import("codegen.zig");
@@ -221,6 +222,7 @@ fn reportPeak() callconv(.c) void {
     var buf: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "PEAK_HEAP {d} allocs {d}\n", .{ peak_tracker.peak, peak_tracker.count }) catch return;
     _ = std.c.write(2, msg.ptr, msg.len);
+    InternPool.census.report();
 }
 
 pub fn main(init: std.process.Init.Minimal) anyerror!void {
