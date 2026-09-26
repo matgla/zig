@@ -204,6 +204,17 @@
 #define zig_callconv(c) __attribute__((c))
 #endif
 
+/* For the few arithmetic helpers whose body is bigger than the call but folds
+ * to a handful of instructions once inlined (constant operands, known-zero
+ * halves) -- the inliner cannot see that from the unoptimised size. */
+#if zig_has_attribute(always_inline) || defined(zig_gcc) || defined(zig_tinyc)
+#define zig_always_inline inline __attribute__((always_inline))
+#elif defined(zig_msvc)
+#define zig_always_inline __forceinline
+#else
+#define zig_always_inline inline
+#endif
+
 #if zig_has_attribute(naked) || defined(zig_gcc)
 #define zig_naked_decl __attribute__((naked))
 #define zig_naked __attribute__((naked))
@@ -2343,13 +2354,29 @@ static inline zig_i128 zig_sub_i128(zig_i128 lhs, zig_i128 rhs) {
     return res;
 }
 
-static zig_i128 zig_mul_i128(zig_i128 lhs, zig_i128 rhs) {
-    zig_extern zig_i128 __multi3(zig_i128 lhs, zig_i128 rhs);
-    return __multi3(lhs, rhs);
+/* 64x64->128 from four 32x32->64 products. Every step is a*b + c + d with c
+ * and d below 2^32, which cannot overflow 64 bits (it is exactly ARM's UMAAL). */
+static zig_always_inline zig_u128 zig_mul_u64_wide(uint64_t lhs, uint64_t rhs) {
+    uint32_t l0 = (uint32_t)lhs, l1 = (uint32_t)(lhs >> 32);
+    uint32_t r0 = (uint32_t)rhs, r1 = (uint32_t)(rhs >> 32);
+    uint64_t p0 = (uint64_t)l0 * r0;
+    uint64_t p1 = (uint64_t)l1 * r0 + (uint32_t)(p0 >> 32);
+    uint64_t p2 = (uint64_t)l0 * r1 + (uint32_t)p1;
+    uint64_t p3 = (uint64_t)l1 * r1 + (uint32_t)(p1 >> 32) + (uint32_t)(p2 >> 32);
+    return zig_make_u128(p3, ((uint64_t)(uint32_t)p2 << 32) | (uint32_t)p0);
 }
 
-static zig_u128 zig_mul_u128(zig_u128 lhs, zig_u128 rhs) {
-    return zig_u128_bitCast_i128(zig_mul_i128(zig_i128_bitCast_u128(lhs, UINT8_C(128)), zig_i128_bitCast_u128(rhs, UINT8_C(128))), UINT8_C(128));
+/* Inline rather than __multi3: the call costs more than the multiply, and a
+ * u64 widened to u128 (wyhash's mum) has a constant-zero high half, so the
+ * cross terms fold away and only the 64x64->128 product is left. */
+static inline zig_u128 zig_mul_u128(zig_u128 lhs, zig_u128 rhs) {
+    zig_u128 res = zig_mul_u64_wide(zig_lo_u128(lhs), zig_lo_u128(rhs));
+    return zig_make_u128(zig_hi_u128(res) + zig_lo_u128(lhs) * zig_hi_u128(rhs)
+                         + zig_hi_u128(lhs) * zig_lo_u128(rhs), zig_lo_u128(res));
+}
+
+static inline zig_i128 zig_mul_i128(zig_i128 lhs, zig_i128 rhs) {
+    return zig_i128_bitCast_u128(zig_mul_u128(zig_u128_bitCast_i128(lhs, UINT8_C(128)), zig_u128_bitCast_i128(rhs, UINT8_C(128))), UINT8_C(128));
 }
 
 static zig_u128 zig_divTrunc_u128(zig_u128 lhs, zig_u128 rhs) {
