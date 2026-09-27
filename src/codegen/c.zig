@@ -1461,7 +1461,10 @@ pub const DeclGen = struct {
                     .small => |s| {
                         const int = ty.intInfo(zcu);
                         var buf: [std.math.big.int.calcTwosCompLimbCount(128)]std.math.big.Limb = undefined;
-                        var bigint: std.math.big.int.Mutable = .init(&buf, undefPattern(u128));
+                        // Without runtime safety nothing may read an undefined value, so it
+                        // renders as 0: the fill pattern costs a wide immediate on every store
+                        // (0xAAAAAAAA is `mvn #0x55555555` on Thumb-2) where 0 is `movs #0`.
+                        var bigint: std.math.big.int.Mutable = .init(&buf, if (safety_on) undefPattern(u128) else 0);
                         bigint.truncate(bigint.toConst(), int.signedness, int.bits);
                         const fmt_undef: FormatInt128 = .{
                             .target = zcu.getTarget(),
@@ -1475,7 +1478,7 @@ pub const DeclGen = struct {
                     },
                     .big => |big| {
                         var buf: [std.math.big.int.calcTwosCompLimbCount(128)]std.math.big.Limb = undefined;
-                        var limb_bigint: std.math.big.int.Mutable = .init(&buf, undefPattern(u128));
+                        var limb_bigint: std.math.big.int.Mutable = .init(&buf, if (safety_on) undefPattern(u128) else 0);
                         limb_bigint.truncate(limb_bigint.toConst(), .unsigned, big.limb_size.bits());
                         const fmt_undef_limb: FormatInt128 = .{
                             .target = zcu.getTarget(),
