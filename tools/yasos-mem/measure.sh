@@ -17,7 +17,7 @@ flags_for() {
   esac
 }
 
-printf '%-14s %12s %10s %8s %10s\n' program peak_heap allocs files status
+printf '%-14s %12s %12s %10s %8s %10s\n' program peak_heap peak_usable allocs files status
 for f in c_main bufprint debug_print containers json; do
   cache="$OUT/cache.$f"
   log="$OUT/$f.log"
@@ -26,14 +26,15 @@ for f in c_main bufprint debug_print containers json; do
       -ofmt=c -OReleaseSmall -fno-incremental $(flags_for "$f") \
       --cache-dir "$cache" --global-cache-dir "$cache" -femit-bin="$OUT/$f.c" > "$log" 2>&1
   rc=$?
-  peak=$(sed -n 's/^PEAK_HEAP \([0-9]*\) allocs \([0-9]*\)$/\1/p' "$log" | tail -1)
-  allocs=$(sed -n 's/^PEAK_HEAP \([0-9]*\) allocs \([0-9]*\)$/\2/p' "$log" | tail -1)
+  peak=$(sed -n 's/^PEAK_HEAP \([0-9]*\) allocs \([0-9]*\).*$/\1/p' "$log" | tail -1)
+  allocs=$(sed -n 's/^PEAK_HEAP \([0-9]*\) allocs \([0-9]*\).*$/\2/p' "$log" | tail -1)
+  usable=$(sed -n 's/^PEAK_HEAP .* usable \([0-9]*\)$/\1/p' "$log" | tail -1)
   nfiles=$(find "$cache" -path '*/z/*' -type f 2>/dev/null | wc -l)
   if [ "$rc" -ne 0 ] || [ ! -s "$OUT/$f.c" ]; then
-    printf '%-14s %12s %10s %8s %10s\n' "$f" "${peak:--}" "${allocs:--}" "$nfiles" "FAILED"
+    printf '%-14s %12s %12s %10s %8s %10s\n' "$f" "${peak:--}" "${usable:--}" "${allocs:--}" "$nfiles" "FAILED"
     head -3 "$log" | sed 's/^/    /'
   else
-    printf '%-14s %12s %10s %8s %10s\n' "$f" "$peak" "$allocs" "$nfiles" "ok"
+    printf '%-14s %12s %12s %10s %8s %10s\n' "$f" "$peak" "${usable:--}" "$allocs" "$nfiles" "ok"
   fi
 done
 echo "artifacts: $OUT"

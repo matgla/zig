@@ -177,6 +177,12 @@ const PeakTracker = struct {
     cur: usize = 0,
     peak: usize = 0,
     count: usize = 0,
+    /// The same, counted in `malloc_usable_size` bytes: what the C allocator actually holds.
+    /// `c_allocator` treats every shrink as a successful in-place resize and never calls
+    /// `realloc`, so a buffer grown and then trimmed (`toOwnedSlice`, `shrinkAndFree`) keeps
+    /// its full size. `cur`/`peak` count the trimmed length and cannot see that.
+    usable_cur: usize = 0,
+    usable_peak: usize = 0,
 
     const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
 
@@ -188,27 +194,41 @@ const PeakTracker = struct {
         self.cur -= @min(sub, self.cur);
         if (self.cur > self.peak) self.peak = self.cur;
     }
+    fn usable(p: [*]u8) usize {
+        return if (@TypeOf(std.c.malloc_usable_size) != void) std.c.malloc_usable_size(p) else 0;
+    }
+    fn noteUsable(self: *PeakTracker, add: usize, sub: usize) void {
+        self.usable_cur += add;
+        self.usable_cur -= @min(sub, self.usable_cur);
+        if (self.usable_cur > self.usable_peak) self.usable_peak = self.usable_cur;
+    }
     fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *PeakTracker = @ptrCast(@alignCast(ctx));
         const p = self.child.rawAlloc(len, a, ra) orelse return null;
         self.count += 1;
         self.note(len, 0);
+        self.noteUsable(usable(p), 0);
         return p;
     }
     fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const old_usable = usable(memory.ptr);
         if (!self.child.rawResize(memory, a, new_len, ra)) return false;
         self.note(new_len, memory.len);
+        self.noteUsable(usable(memory.ptr), old_usable);
         return true;
     }
     fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const old_usable = usable(memory.ptr);
         const p = self.child.rawRemap(memory, a, new_len, ra) orelse return null;
         self.note(new_len, memory.len);
+        self.noteUsable(usable(p), old_usable);
         return p;
     }
     fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
         const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        self.noteUsable(0, usable(memory.ptr));
         self.child.rawFree(memory, a, ra);
         self.note(0, memory.len);
     }
@@ -220,7 +240,7 @@ extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
 
 fn reportPeak() callconv(.c) void {
     var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "PEAK_HEAP {d} allocs {d}\n", .{ peak_tracker.peak, peak_tracker.count }) catch return;
+    const msg = std.fmt.bufPrint(&buf, "PEAK_HEAP {d} allocs {d} usable {d}\n", .{ peak_tracker.peak, peak_tracker.count, peak_tracker.usable_peak }) catch return;
     _ = std.c.write(2, msg.ptr, msg.len);
     InternPool.census.report();
 }
