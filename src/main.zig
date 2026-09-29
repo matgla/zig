@@ -44,6 +44,11 @@ const thread_stack_size = 60 << 20;
 pub const std_options: std.Options = .{
     .logFn = log,
 
+    // The alternate signal stack is for the segfault handler, which std installs only with
+    // runtime safety. Without it the stack is 256 KiB of .bss that nothing runs on -- and on a
+    // microcontroller every process pays for its .bss in RAM.
+    .signal_stack_size = if (std.debug.default_enable_segfault_handler) (std.Options{}).signal_stack_size else null,
+
     .log_level = switch (builtin.mode) {
         .debug => .debug,
         .safe, .fast => .info,
