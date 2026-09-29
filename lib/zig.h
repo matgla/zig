@@ -215,14 +215,20 @@
 #define zig_always_inline inline
 #endif
 
-#if zig_has_attribute(naked) || defined(zig_gcc)
+#if zig_has_attribute(naked) || defined(zig_gcc) || defined(zig_tinyc)
 #define zig_naked_decl __attribute__((naked))
 #define zig_naked __attribute__((naked))
 #elif defined(zig_msvc)
 #define zig_naked_decl
 #define zig_naked __declspec(naked)
 #else
-#define zig_naked_decl zig_naked_unavailable
+/* A declaration does not need the attribute -- only a definition does, and the
+ * MSVC branch above already relies on that. Leaving it as an unavailable
+ * identifier made every *declaration* of a naked function a syntax error, so a
+ * compiler-rt object built with the C backend could not be compiled by a
+ * toolchain that lacks the attribute (tinycc) even when the routines it
+ * declares come from that toolchain's own runtime. */
+#define zig_naked_decl
 #define zig_naked zig_naked_unavailable
 #endif
 
