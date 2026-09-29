@@ -286,6 +286,9 @@ const c_allocator_impl = struct {
         return new_len <= usable_len;
     }
 
+    /// The least a shrink must free for `remap` to hand it to `realloc`.
+    const shrink_release_min = 128;
+
     fn remap(
         ctx: *anyopaque,
         memory: []u8,
@@ -294,6 +297,24 @@ const c_allocator_impl = struct {
         return_address: usize,
     ) ?[*]u8 {
         assert(new_len > 0);
+        // `resize` reports every shrink as done in place, and it is -- but nothing is given back
+        // to `malloc`, so a buffer grown and then trimmed (`toOwnedSlice`, `shrinkToLen`) keeps
+        // its whole allocation for as long as it lives. `remap` may move, so a shrink that frees
+        // something worth having goes through `realloc`, which can return the tail.
+        if (new_len < memory.len and memory.len - new_len >= shrink_release_min) {
+            switch (allocStrat(alignment)) {
+                .raw => {
+                    const actual_len = @max(new_len, @alignOf(std.c.max_align_t));
+                    if (c.realloc(memory.ptr, actual_len)) |new_ptr| {
+                        assert(alignment.check(@intFromPtr(new_ptr)));
+                        return @ptrCast(new_ptr);
+                    }
+                    // A failed shrink leaves the block as it was.
+                },
+                // `realloc` could lose the alignment; keep the block.
+                .posix_memalign, .manual_align => {},
+            }
+        }
         // Prefer resizing in-place if possible, since `realloc` could be expensive even if legal.
         if (resize(ctx, memory, alignment, new_len, return_address)) {
             return memory.ptr;
