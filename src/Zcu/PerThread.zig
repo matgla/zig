@@ -489,12 +489,19 @@ pub fn updateFile(
         .global_cache, .zig_lib => false,
     };
 
+    // Only the main module's tests are ever analyzed, in any kind of compilation, so a file of
+    // any other module is lowered without them. For the standard library that is most of what
+    // it has: its tests are inline with the code they test.
+    const strip_tests = if (file.mod) |mod| mod != zcu.main_mod else false;
+
     const hex_digest: Cache.HexDigest = d: {
         var h: Cache.HashHelper = .{};
         // As well as the file path, we also include the compiler version in case of backwards-incompatible ZIR changes.
         file.path.addToHasher(&h.hasher);
         h.addBytes(build_options.version);
         h.add(builtin.zig_backend);
+        // The same file lowers differently without its tests, so it is cached apart.
+        if (strip_tests) h.addBytes("strip_tests");
         break :d h.final();
     };
 
@@ -656,7 +663,7 @@ pub fn updateFile(
         timer = comp.startTimer();
         switch (file.getMode()) {
             .zig => {
-                file.zir = try AstGen.generate(gpa, file.tree.?);
+                file.zir = try AstGen.generateOptions(gpa, file.tree.?, .{ .strip_tests = strip_tests });
                 Zcu.saveZirCache(gpa, &cache_file_writer, stat, file.zir.?) catch |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => log.warn("unable to write cached ZIR code for {f} to {f}{s}: {t}", .{

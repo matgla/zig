@@ -47,6 +47,8 @@ fn_var_args: bool = false,
 /// Whether we are somewhere within a function. If `true`, any container decls may be
 /// generic and thus must be tunneled through closure.
 within_fn: bool = false,
+/// See `Options.strip_tests`.
+strip_tests: bool = false,
 /// The return type of the current function. This may be a trivial `Ref`, or
 /// otherwise it refers to a `ret_type` instruction.
 fn_ret_ty: Zir.Inst.Ref = .none,
@@ -140,7 +142,19 @@ fn appendRefsAssumeCapacity(astgen: *AstGen, refs: []const Zir.Inst.Ref) void {
     astgen.extra.appendSliceAssumeCapacity(@ptrCast(refs));
 }
 
+pub const Options = struct {
+    /// Lower no `test` declarations at all: the ZIR is as if the source had none. Only for a
+    /// file whose tests can never be analyzed -- one outside the main module, since only the
+    /// main module's tests run -- because AstGen errors inside a test body are then not
+    /// reported, and the ZIR must be cached apart from a full lowering of the same file.
+    strip_tests: bool = false,
+};
+
 pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
+    return generateOptions(gpa, tree, .{});
+}
+
+pub fn generateOptions(gpa: Allocator, tree: Ast, options: Options) Allocator.Error!Zir {
     assert(tree.mode == .zig);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -154,6 +168,7 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
         .arena = arena.allocator(),
         .tree = &tree,
         .nodes_need_rl = &nodes_need_rl,
+        .strip_tests = options.strip_tests,
         .src_hasher = undefined, // `structDeclInner` for the root struct will set this
     };
     defer astgen.deinit(gpa);
@@ -5648,6 +5663,8 @@ fn containerMember(
             };
         },
         .test_decl => {
+            // `scanContainer` did not count it either.
+            if (astgen.strip_tests) return .decl;
             const prev_decl_index = wip_decls.index;
             // We need to have *some* decl here so that the decl count matches what's expected.
             // Since it doesn't strictly matter *what* this is, let's save ourselves the trouble
@@ -12901,6 +12918,8 @@ fn scanContainer(
 
     var any_duplicates = false;
     var decl_count: u32 = 0;
+    // Members that are neither declarations nor fields: `test`s under `strip_tests`.
+    var stripped_count: u32 = 0;
     var any_field_aligns = false;
     var any_field_values = false;
     var any_comptime_fields = false;
@@ -12956,6 +12975,10 @@ fn scanContainer(
             },
 
             .test_decl => {
+                if (astgen.strip_tests) {
+                    stripped_count += 1;
+                    continue;
+                }
                 decl_count += 1;
                 // We don't want shadowing detection here, and test names work a bit differently, so
                 // we must do the redeclaration detection ourselves.
@@ -13088,7 +13111,7 @@ fn scanContainer(
         if (any_invalid_declarations) return error.AnalysisFail;
         return .{
             .decls_len = decl_count,
-            .fields_len = @intCast(members.len - decl_count),
+            .fields_len = @intCast(members.len - decl_count - stripped_count),
             .any_field_aligns = any_field_aligns,
             .any_field_values = any_field_values,
             .any_comptime_fields = any_comptime_fields,
