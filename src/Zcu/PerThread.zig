@@ -346,6 +346,9 @@ pub fn update(
 
             error.AnalysisFail => {},
         };
+        // Every frame that analyzed `unit` has returned, so nothing holds a slice into
+        // storage the pool superseded meanwhile.
+        zcu.intern_pool.reclaimRetired(gpa);
     }
 }
 fn workerUpdateBuiltinFile(comp: *Compilation, file: *Zcu.File) void {

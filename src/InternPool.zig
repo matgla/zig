@@ -287,6 +287,7 @@ pub fn trackZir(
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+    local.poolRetire(gpa, map.header());
     new_map.header().* = .{ .capacity = new_map_capacity };
     @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
     const new_map_mask = new_map.header().mask();
@@ -382,6 +383,7 @@ pub fn rehashTrackedInsts(
             Map.entries_offset + want_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+        owner_local.poolRetire(gpa, shard.shared.tracked_inst_map.header());
         new_map.header().* = .{ .capacity = want_capacity };
         @memset(new_map.entries[0..want_capacity], .{ .value = .none, .hash = undefined });
         shard.shared.tracked_inst_map.release(new_map);
@@ -972,12 +974,16 @@ const Local = struct {
         /// Unused in single-threaded builds; see `owned`.
         arena: std.heap.ArenaAllocator.State,
         /// A single-threaded build has no GPA contention to avoid, so it takes those buffers
-        /// straight from the GPA and records them here instead, releasing the lot at teardown.
-        /// The retention guarantee above is unchanged -- nothing is freed early, because callers
-        /// legitimately hold slices into superseded storage across further interning (see the
-        /// `field_types`/`field_offsets` loop in `codegen.zig`). What this drops is the arena's
+        /// straight from the GPA and records them here instead. What this drops is the arena's
         /// node growth, which stranded 24-42% of everything it handed out.
         owned: if (single_threaded) Owned else void,
+        /// Single-threaded only: buffers superseded by a grown copy, moved here from `owned`.
+        /// They are NOT freed on the spot -- callers legitimately hold slices into superseded
+        /// storage across further interning (see the `field_types`/`field_offsets` loop in
+        /// `codegen.zig`) -- but at the next `InternPool.reclaimRetired`, which runs where no
+        /// such slice can be live: between top-level analysis units. Without this they were
+        /// kept to teardown, and were about as large as the live storage itself.
+        retired: if (single_threaded) Owned else void,
 
         items: ListMutate,
         extra: ListMutate,
@@ -1231,9 +1237,13 @@ const Local = struct {
                         const new_slice = new_list.view().slice();
                         inline for (fields) |field| @memcpy(new_slice.items(field)[0..len], old_slice.items(field)[0..len]);
                     }
-                    mutable.mutate.mutex.lockUncancelable(io);
-                    defer mutable.mutate.mutex.unlock(io);
-                    mutable.list.release(new_list);
+                    const old_list = mutable.list.*;
+                    {
+                        mutable.mutate.mutex.lockUncancelable(io);
+                        defer mutable.mutate.mutex.unlock(io);
+                        mutable.list.release(new_list);
+                    }
+                    mutable.local.poolRetire(mutable.gpa, old_list.header());
                 }
 
                 pub fn viewAllowEmpty(mutable: Mutable) View {
@@ -1330,6 +1340,22 @@ const Local = struct {
         return buf;
     }
 
+    /// `base`, the start of a buffer `poolAlloc` returned, has been superseded by a grown copy.
+    /// Single-threaded, it is released at the next `InternPool.reclaimRetired`; otherwise it
+    /// stays in the arena like everything else.
+    fn poolRetire(local: *Local, gpa: Allocator, base: *const anyopaque) void {
+        if (!single_threaded) return;
+        const owned = &local.mutate.owned;
+        for (owned.items, 0..) |buf, i| {
+            if (@as(*const anyopaque, buf.ptr) != base) continue;
+            // Best effort: if `retired` cannot grow, the buffer just stays owned to teardown.
+            local.mutate.retired.append(gpa, buf) catch return;
+            _ = owned.swapRemove(i);
+            return;
+        }
+        // Not ours: a list or map still on its static `empty` sentinel.
+    }
+
     /// Releases everything `poolAlloc` handed out. Call once, at teardown.
     fn poolFree(local: *Local, gpa: Allocator) void {
         if (!single_threaded) {
@@ -1340,6 +1366,10 @@ const Local = struct {
             gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
         }
         local.mutate.owned.deinit(gpa);
+        for (local.mutate.retired.items) |buf| {
+            gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+        }
+        local.mutate.retired.deinit(gpa);
     }
 
     pub fn getMutableItems(local: *Local, gpa: Allocator, io: Io) List(Item).Mutable {
@@ -6378,6 +6408,7 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
         .mutate = .{
             .arena = .{},
             .owned = if (single_threaded) .empty else {},
+            .retired = if (single_threaded) .empty else {},
 
             .items = .empty,
             .extra = .empty,
@@ -6446,6 +6477,19 @@ pub const census = struct {
     pub var retired_lists: usize = 0;
     /// Same, for shard map tables superseded by a rehash.
     pub var retired_maps: usize = 0;
+    /// Bytes of the two above that `reclaimRetired` has since released.
+    pub var reclaimed: usize = 0;
+
+    /// `ZIG_IP_POISON_RETIRED` set: `reclaimRetired` fills superseded storage with 0xaa and
+    /// keeps it instead of freeing it, so a slice held across a reclaim point changes the
+    /// output (compare against a normal run) rather than reading whatever reuses the memory.
+    fn poisonRetired() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached == null) S.cached = builtin.link_libc and std.c.getenv("ZIG_IP_POISON_RETIRED") != null;
+        return S.cached.?;
+    }
 
     pub fn note(ip: *const InternPool, gpa: Allocator) void {
         pool = ip;
@@ -6501,12 +6545,35 @@ pub const census = struct {
             maps += shard.shared.tracked_inst_map.tableBytes();
         }
         std.debug.print("IP_FIELDMAPS {d} entries {d}\n", .{ field_maps, field_map_entries });
-        std.debug.print("IP_ARENA {d} IP_LIVE {d} IP_RETIRED {d} IP_MAPS {d} IP_RMAPS {d} IP_SLACK {d}\n", .{
+        std.debug.print("IP_ARENA {d} IP_LIVE {d} IP_RETIRED {d} IP_MAPS {d} IP_RMAPS {d} IP_SLACK {d} IP_RECLAIMED {d}\n", .{
             arena,     live,           retired_lists, maps,       retired_maps,
-            arena -| live -| retired_lists -| maps -| retired_maps,
+            arena -| live -| retired_lists -| maps -| retired_maps, reclaimed,
         });
     }
 };
+
+/// Frees the storage superseded since the last call (see `Local.mutate.retired`). Only sound
+/// where nothing can still hold a slice into the pool's lists or maps: the main analysis loop
+/// calls it between top-level units, when every frame that could have taken one has returned.
+/// A no-op unless single-threaded, where other threads could be reading the old storage.
+pub fn reclaimRetired(ip: *InternPool, gpa: Allocator) void {
+    if (!single_threaded) return;
+    for (ip.locals) |*local| {
+        const retired = &local.mutate.retired;
+        if (retired.items.len == 0) continue;
+        if (build_options.peak_heap and census.poisonRetired()) {
+            // Validation: keep the memory but make any stale read of it visible.
+            for (retired.items) |buf| @memset(buf.ptr[0..buf.len], 0xaa);
+            local.mutate.owned.appendSlice(gpa, retired.items) catch return;
+        } else {
+            for (retired.items) |buf| gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+        }
+        if (build_options.peak_heap) {
+            for (retired.items) |buf| census.reclaimed += buf.len;
+        }
+        retired.clearRetainingCapacity();
+    }
+}
 
 pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
     std.debug.assert(debug_state.intern_pool == null);
@@ -7348,6 +7415,7 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+        local.poolRetire(gpa, map.header());
         new_map.header().* = .{ .capacity = new_map_capacity };
         @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
         const new_map_mask = new_map.header().mask();
@@ -11621,6 +11689,7 @@ pub fn getOrPutTrailingString(
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+    local.poolRetire(gpa, map.header());
     new_map.header().* = .{ .capacity = new_map_capacity };
     @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
     const new_map_mask = new_map.header().mask();
@@ -12577,6 +12646,7 @@ const GlobalErrorSet = struct {
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+        local.poolRetire(gpa, map.header());
         new_map.header().* = .{ .capacity = new_map_capacity };
         @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
         const new_map_mask = new_map.header().mask();
