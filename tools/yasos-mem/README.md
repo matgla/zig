@@ -83,3 +83,24 @@ the shell; includes the 512 KiB stack and .data): fs_hello 3,845,888 ->
 
 What is left, for fs_hellofmt: resident ZIR ~50% of peak, and the parse/AstGen
 transient of the file being lowered ~25%.
+
+## `-Dcpu-family=arm` -- 2026-09-29, branch `mcu-cpu-families`
+
+The device compiler carries only the ARM CPU feature and model tables. It then
+refuses every other architecture family ("this compiler was built without
+support for the 'riscv' architecture family"); the family it runs on is always
+kept. `apps/zig/build_zig.sh` in yasos passes it (`ZIG_CPU_FAMILIES`, default
+`arm`).
+
+zig.o under tcc -O2: .data 281,004 -> 83,420, .text 3,686,580 -> 3,565,072;
+the YAFF image 4,374,736 -> 3,988,392 B, its data segment (copied to RAM at
+exec) 663,600 -> 342,864.
+
+On the device (same measurement as above, A/B from the same commit):
+
+| program | all families | arm only | change |
+|---|---|---|---|
+| fs_hello | 3,073,536 | 2,875,648 | -197,888 (-6.4%) |
+| fs_hellofmt | 4,400,640 | 4,137,216 | -263,424 (-6.0%) |
+
+Generated C is byte-identical; compile times unchanged (0.90 / 1.8 s).

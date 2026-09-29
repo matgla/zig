@@ -206,6 +206,7 @@ pub fn build(b: *std.Build) !void {
     const value_tracing = b.option(bool, "value-tracing", "Enable extra state tracking to help troubleshoot bugs in the compiler (using the std.debug.Trace API)") orelse false;
     const peak_heap = b.option(bool, "peak-heap", "Wrap the root allocator to report peak live heap bytes at exit (measurement only; requires libc)") orelse false;
     const zir_budget = b.option(u64, "zir-budget", "Keep at most this many bytes of ZIR loaded, reloading evicted files from the ZIR cache (0: no limit)") orelse 0;
+    const cpu_families = b.option([]const std.Target.Cpu.Arch.Family, "cpu-family", "Link in the CPU feature and model tables of only these architecture families (repeatable); the compiler can then target only them and its own") orelse &.{};
 
     const mem_leak_frames: u32 = b.option(u32, "mem-leak-frames", "How many stack frames to print when a memory leak occurs. Tests get 2x this amount.") orelse blk: {
         if (strip == true) break :blk @as(u32, 0);
@@ -404,6 +405,11 @@ pub fn build(b: *std.Build) !void {
     exe_options.addOption(bool, "value_tracing", value_tracing);
     exe_options.addOption(bool, "peak_heap", peak_heap);
     exe_options.addOption(u64, "zir_budget", zir_budget);
+    {
+        const names = b.allocator.alloc([]const u8, cpu_families.len) catch @panic("OOM");
+        for (names, cpu_families) |*name, family| name.* = @tagName(family);
+        exe_options.addOption([]const []const u8, "cpu_families", names);
+    }
     if (tracy) |tracy_dir| {
         const tracy_mod = b.createModule(.{
             .target = target,
@@ -789,6 +795,7 @@ fn addWasiUpdateStep(b: *std.Build, version: [:0]const u8) !void {
     exe_options.addOption(bool, "value_tracing", false);
     exe_options.addOption(bool, "peak_heap", false);
     exe_options.addOption(u64, "zir_budget", 0);
+    exe_options.addOption([]const []const u8, "cpu_families", &.{});
     exe_options.addOption(DevEnv, "dev", .bootstrap);
     exe_options.addOption(IoMode, "io_mode", .threaded);
 

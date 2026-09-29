@@ -1728,17 +1728,39 @@ pub const Cpu = struct {
         }
 
         /// All CPU features Zig is aware of, sorted lexicographically by name.
+        /// Empty if the program was built without the tables of `arch` (see `hasCpuTables`).
         pub fn allFeaturesList(arch: Arch) []const Cpu.Feature {
             return switch (arch.family()) {
-                inline else => |f| &@field(Target, @tagName(f)).all_features,
+                inline else => |f| if (comptime familyHasCpuTables(f))
+                    &@field(Target, @tagName(f)).all_features
+                else
+                    &.{},
             };
         }
 
         /// All processors Zig is aware of, sorted lexicographically by name.
+        /// Empty if the program was built without the tables of `arch` (see `hasCpuTables`).
         pub fn allCpuModels(arch: Arch) []const *const Cpu.Model {
             return switch (arch.family()) {
-                inline else => |f| comptime allCpusFromDecls(@field(Target, @tagName(f)).cpu),
+                inline else => |f| if (comptime familyHasCpuTables(f))
+                    comptime allCpusFromDecls(@field(Target, @tagName(f)).cpu)
+                else
+                    &.{},
             };
+        }
+
+        /// Whether the program carries the CPU feature and model tables of `arch`; see
+        /// `std.Options.cpu_families`. Without them, CPU models and features of `arch` cannot be
+        /// looked up or have their dependencies resolved, so a compiler must not target it.
+        pub fn hasCpuTables(arch: Arch) bool {
+            return switch (arch.family()) {
+                inline else => |f| comptime familyHasCpuTables(f),
+            };
+        }
+
+        fn familyHasCpuTables(comptime f: Family) bool {
+            const families = std.Options.cpu_families orelse return true;
+            return f == builtin.cpu.arch.family() or std.mem.indexOfScalar(Family, families, f) != null;
         }
 
         fn allCpusFromDecls(comptime cpus: type) []const *const Cpu.Model {

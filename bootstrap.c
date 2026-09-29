@@ -187,6 +187,7 @@ int main(int argc, char **argv) {
             "pub const zir_budget: u64 = 0;\n"
             "pub const skip_non_native = false;\n"
             "pub const debug_gpa = false;\n"
+            "pub const cpu_families: []const []const u8 = &.{};\n"
             "pub const dev = .core;\n"
             "pub const io_mode: enum { threaded, evented } = .threaded;\n"
             "pub const value_interpret_mode = .direct;\n"

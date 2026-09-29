@@ -14,6 +14,7 @@ pub const peak_heap = false;
 pub const zir_budget: u64 = 0;
 pub const skip_non_native = false;
 pub const debug_gpa = false;
+pub const cpu_families: []const []const u8 = &.{};
 pub const dev = .core;
 pub const io_mode: enum { threaded, evented } = .threaded;
 pub const value_interpret_mode = .direct;
