@@ -163,6 +163,8 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, options: ParseOptions) Alloca
         });
         if (token.tag == .eof) break;
     }
+    // Growth leaves up to half the capacity unused; give it back before the nodes are allocated.
+    tokens.shrinkAndFree(gpa, tokens.len);
 
     var tokens_slice = tokens.toOwnedSlice();
     errdefer tokens_slice.deinit(gpa);
@@ -203,8 +205,8 @@ pub fn parseTokens(
 
     try parser.extra_data.shrinkToLen(gpa);
     try parser.errors.shrinkToLen(gpa);
+    parser.nodes.shrinkAndFree(gpa, parser.nodes.len);
 
-    // TODO experiment with compacting the MultiArrayList slices here
     return .{
         .source = source,
         .mode = options.mode,

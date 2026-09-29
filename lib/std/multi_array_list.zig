@@ -460,6 +460,22 @@ pub fn MultiArrayList(comptime T: type) type {
 
             assert(new_len <= self.capacity);
             assert(new_len <= self.len);
+            if (new_len == self.capacity) {
+                self.len = new_len;
+                return;
+            }
+
+            // Shrink in place where the allocator can: slide every field down to where it
+            // sits at capacity `new_len` (never above where it is now), then give the tail
+            // back. Copying into a fresh allocation would need both buffers at once.
+            self.len = new_len;
+            self.moveFields(self.capacity, new_len);
+            if (gpa.remap(self.allocatedBytes(), capacityInBytes(new_len))) |new_bytes| {
+                self.bytes = new_bytes.ptr;
+                self.capacity = new_len;
+                return;
+            }
+            self.moveFields(new_len, self.capacity);
 
             const other_bytes = gpa.alignedAlloc(u8, sizes.big_align, capacityInBytes(new_len)) catch {
                 const self_slice = self.slice();
@@ -492,6 +508,37 @@ pub fn MultiArrayList(comptime T: type) type {
             }
             gpa.free(self.allocatedBytes());
             self.* = other;
+        }
+
+        /// Moves the first `len` elements of every field from where they sit in a buffer of
+        /// capacity `from` to where they sit in one of capacity `to`, within `bytes`. Fields
+        /// are laid out in `sizes` order, so moving down goes front to back and moving up
+        /// back to front; either way no field lands on one not yet moved.
+        fn moveFields(self: Self, from: usize, to: usize) void {
+            if (from == to) return;
+            var from_offs: [sizes.bytes.len]usize = undefined;
+            var to_offs: [sizes.bytes.len]usize = undefined;
+            var from_off: usize = 0;
+            var to_off: usize = 0;
+            for (sizes.bytes, 0..) |field_size, i| {
+                from_offs[i] = from_off;
+                to_offs[i] = to_off;
+                from_off += field_size * from;
+                to_off += field_size * to;
+            }
+            if (to < from) {
+                for (sizes.bytes, from_offs, to_offs) |field_size, src, dst| {
+                    const n = field_size * self.len;
+                    @memmove(self.bytes[dst..][0..n], self.bytes[src..][0..n]);
+                }
+            } else {
+                var i = sizes.bytes.len;
+                while (i > 0) {
+                    i -= 1;
+                    const n = sizes.bytes[i] * self.len;
+                    @memmove(self.bytes[to_offs[i]..][0..n], self.bytes[from_offs[i]..][0..n]);
+                }
+            }
         }
 
         pub fn clearAndFree(self: *Self, gpa: Allocator) void {
@@ -1049,6 +1096,57 @@ test "sorting a span" {
             n += 1;
         }
         c += 1;
+    }
+}
+
+test "shrinkAndFree keeps every field, in place or by copying" {
+    const Foo = struct {
+        a: u8,
+        b: u64,
+        c: u16,
+        d: u0,
+    };
+    // Refuses to change an allocation's size, then (optionally) to allocate at all.
+    const Stubborn = struct {
+        child: Allocator,
+        fail_alloc: bool = false,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = Allocator.noResize, .remap = Allocator.noRemap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.fail_alloc) return null;
+            return self.child.rawAlloc(len, a, ra);
+        }
+        fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(memory, a, ra);
+        }
+    };
+    for ([_]enum { remap, copy, oom }{ .remap, .copy, .oom }) |how| {
+        var stubborn: Stubborn = .{ .child = testing.allocator };
+        const ally = if (how == .remap) testing.allocator else stubborn.allocator();
+
+        var list: MultiArrayList(Foo) = .empty;
+        defer list.deinit(ally);
+        try list.setCapacity(ally, 100);
+        for (0..37) |i| list.appendAssumeCapacity(.{
+            .a = @intCast(i),
+            .b = 0x1111_0000_0000 + i,
+            .c = @intCast(1000 + i),
+            .d = 0,
+        });
+
+        if (how == .oom) stubborn.fail_alloc = true;
+        list.shrinkAndFree(ally, 20);
+        try testing.expectEqual(20, list.len);
+        try testing.expectEqual(@as(usize, if (how == .oom) 100 else 20), list.capacity);
+        for (0..20) |i| {
+            try testing.expectEqual(@as(u8, @intCast(i)), list.items(.a)[i]);
+            try testing.expectEqual(0x1111_0000_0000 + i, list.items(.b)[i]);
+            try testing.expectEqual(@as(u16, @intCast(1000 + i)), list.items(.c)[i]);
+        }
+        stubborn.fail_alloc = false;
     }
 }
 
