@@ -2676,7 +2676,7 @@ pub fn typeDeclSrcLine(ty: Type, zcu: *Zcu) ?u32 {
     const info = tracked.resolveFull(&zcu.intern_pool) orelse return null;
     const file = zcu.fileByIndex(info.file);
     const zir = switch (file.getMode()) {
-        .zig => file.zir.?,
+        .zig => file.getZir(zcu),
         .zon => return 0,
     };
     const inst = zir.instructions.get(@backingInt(info.inst));

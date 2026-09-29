@@ -6745,7 +6745,10 @@ fn analyzeCall(
     // We might still learn that this call is inline *after* evaluating the generic return type.
     const early_known_inline = inline_requested or block.isComptime();
 
-    // These values are undefined if `func_val == null`.
+    // These values are undefined if `func_val == null`. `fn_zir` is used for the rest of the
+    // call, which may import and so evict ZIR: the callee's file stays pinned until it returns.
+    var fn_file: ?*Zcu.File = null;
+    defer if (fn_file) |file| file.unpinZir();
     const fn_nav: InternPool.Nav, const fn_zir: Zir, const fn_tracked_inst: InternPool.TrackedInst.Index, const fn_zir_inst: Zir.Inst.Index, const fn_zir_info: Zir.FnInfo = if (func_val) |f| b: {
         const info = ip.indexToKey(f.toIntern()).func;
         const nav = ip.getNav(info.owner_nav);
@@ -6753,8 +6756,10 @@ fn analyzeCall(
             return sema.failTransitive(.{ .lost_tracking = info.zir_body_inst });
         };
         const file = zcu.fileByIndex(resolved_func_inst.file);
-        const zir_info = file.zir.?.getFnInfo(resolved_func_inst.inst);
-        break :b .{ nav, file.zir.?, info.zir_body_inst, resolved_func_inst.inst, zir_info };
+        const zir = file.pinZir(zcu);
+        fn_file = file;
+        const zir_info = zir.getFnInfo(resolved_func_inst.inst);
+        break :b .{ nav, zir, info.zir_body_inst, resolved_func_inst.inst, zir_info };
     } else .{ undefined, undefined, undefined, undefined, undefined };
 
     // This is the `inst_map` used when evaluating generic parameters and return types.

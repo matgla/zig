@@ -348,6 +348,12 @@ codegen_task_pool: CodegenTaskPool,
 
 generation: u32 = 0,
 
+/// When nonzero, `evictZir` drops the ZIR of least recently used files while more than this
+/// many bytes of it are loaded; `File.getZir` reloads it from the ZIR cache on demand. For a
+/// device where RAM, not the cache, is what runs out. Set from `build_options.zir_budget`, or
+/// the `ZIG_ZIR_BUDGET` environment variable when linking libc.
+zir_budget: usize = 0,
+
 pub const DependencyReason = struct {
     src: LazySrcLoc,
     /// Only populated if this is for a `.type_layout` unit.
@@ -881,6 +887,15 @@ pub const Namespace = struct {
     /// All `test` declarations in this namespace. We store these purely so that incremental
     /// compilation can re-use the existing `Nav`s when a namespace changes.
     test_decls: std.ArrayList(InternPool.Nav.Index) = .empty,
+    /// The members of `pub_decls` and `priv_decls` marked `export`, which `resolveReferences`
+    /// treats as referenced. Recorded when scanning so that finding them does not mean reading
+    /// every declaration's ZIR (and reloading every file `evictZir` dropped).
+    export_decls: std.ArrayList(ExportDecl) = .empty,
+
+    pub const ExportDecl = struct {
+        nav: InternPool.Nav.Index,
+        is_pub: bool,
+    };
 
     pub const Index = InternPool.NamespaceIndex;
     pub const OptionalIndex = InternPool.OptionalNamespaceIndex;
@@ -1036,6 +1051,54 @@ pub const File = struct {
     /// When `zoir` is updated, this field is set to `true`. In `updateZirRefs`, if this is `true`,
     /// we invalidate the corresponding `source_file` dependency, and reset it to `false`.
     zoir_invalidated: bool,
+
+    /// The ZIR cache file `zir` was written to or read from: what lets `Zcu.evictZir` drop the
+    /// ZIR and `getZir` bring it back. `null` if there is none (the cache could not be written).
+    zir_cache: ?ZirCacheEntry = null,
+    /// `zir_clock` when `getZir` last handed out this file's ZIR; eviction is least recent first.
+    zir_last_use: u32 = 0,
+    /// Holders that keep this file's ZIR loaded through `Zcu.evictZir(.within_unit)`; see
+    /// `pinZir`.
+    zir_pins: u32 = 0,
+
+    pub const ZirCacheEntry = struct {
+        digest: Cache.HexDigest,
+        /// `Zcu.local_zir_cache` rather than `Zcu.global_zir_cache`.
+        local: bool,
+    };
+
+    /// This file's ZIR, reloaded from its ZIR cache file if `Zcu.evictZir` dropped it. Every
+    /// read of a successfully lowered file's ZIR during or after semantic analysis goes through
+    /// here; `file.zir` itself is only for AstGen and incremental bookkeeping.
+    pub fn getZir(file: *File, zcu: *const Zcu) Zir {
+        if (file.zir == null) zcu.reloadZir(file);
+        if (builtin.single_threaded) {
+            zir_clock +%= 1;
+            file.zir_last_use = zir_clock;
+        }
+        return file.zir.?;
+    }
+
+    /// `getZir`, and keeps the ZIR loaded until the matching `unpinZir`. Eviction also runs in
+    /// the middle of analysis, before a lazily imported file is lowered (the moment the loaded
+    /// ZIR grows), so anything that holds a file's ZIR across analysis that may import must pin
+    /// it: every `Sema` for the file it analyzes, `Sema.analyzeCall` for the callee's, and the
+    /// functions that set those up.
+    pub fn pinZir(file: *File, zcu: *const Zcu) Zir {
+        const zir = file.getZir(zcu);
+        file.zir_pins += 1;
+        return zir;
+    }
+
+    pub fn unpinZir(file: *File) void {
+        file.zir_pins -= 1;
+    }
+
+    /// Like `getZir`, for a caller that wants to point at it.
+    pub fn getZirPtr(file: *File, zcu: *const Zcu) *const Zir {
+        _ = file.getZir(zcu);
+        return &file.zir.?;
+    }
 
     pub const Path = struct {
         root: enum {
@@ -2759,7 +2822,7 @@ pub const LazySrcLoc = struct {
         if (zir_inst == .main_struct_inst) return .{ file, .root };
 
         // Otherwise, make sure ZIR is loaded.
-        const zir = file.zir.?;
+        const zir = file.getZir(zcu);
 
         const inst = zir.instructions.get(@backingInt(zir_inst));
         const base_node: Ast.Node.Index = switch (inst.tag) {
@@ -4287,7 +4350,7 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
                 // `test` declarations are analyzed depending on the test filter.
                 const inst_info = nav.analysis.?.zir_index.resolveFull(ip) orelse continue;
                 const file = zcu.fileByIndex(inst_info.file);
-                const decl = file.zir.?.getDeclaration(inst_info.inst);
+                const decl = file.getZir(zcu).getDeclaration(inst_info.inst);
 
                 if (!comp.config.is_test or file.mod != zcu.main_mod) continue;
 
@@ -4323,40 +4386,22 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
                     }
                 }
             }
-            for (zcu.namespacePtr(ns).pub_decls.keys()) |nav| {
-                // These are named declarations. They are analyzed only if marked `export`.
+            // Named declarations are analyzed only if marked `export`: public ones first, then
+            // private, as a walk of `pub_decls` and then `priv_decls` would find them.
+            for ([_]bool{ true, false }) |want_pub| for (zcu.namespacePtr(ns).export_decls.items) |exp| {
+                if (exp.is_pub != want_pub) continue;
+                const nav = exp.nav;
                 const inst_info = ip.getNav(nav).analysis.?.zir_index.resolveFull(ip) orelse continue;
-                const file = zcu.fileByIndex(inst_info.file);
-                const decl = file.zir.?.getDeclaration(inst_info.inst);
-                if (decl.linkage == .@"export") {
-                    const unit: AnalUnit = .wrap(.{ .nav_val = nav });
-                    const gop = try units.getOrPut(gpa, unit);
-                    if (!gop.found_existing) {
-                        refs_log.debug("type '{f}': ref named %{}", .{
-                            Type.fromInterned(ty).containerTypeName(ip).fmt(ip),
-                            @backingInt(inst_info.inst),
-                        });
-                        gop.value_ptr.* = referencer;
-                    }
+                const unit: AnalUnit = .wrap(.{ .nav_val = nav });
+                const gop = try units.getOrPut(gpa, unit);
+                if (!gop.found_existing) {
+                    refs_log.debug("type '{f}': ref named %{}", .{
+                        Type.fromInterned(ty).containerTypeName(ip).fmt(ip),
+                        @backingInt(inst_info.inst),
+                    });
+                    gop.value_ptr.* = referencer;
                 }
-            }
-            for (zcu.namespacePtr(ns).priv_decls.keys()) |nav| {
-                // These are named declarations. They are analyzed only if marked `export`.
-                const inst_info = ip.getNav(nav).analysis.?.zir_index.resolveFull(ip) orelse continue;
-                const file = zcu.fileByIndex(inst_info.file);
-                const decl = file.zir.?.getDeclaration(inst_info.inst);
-                if (decl.linkage == .@"export") {
-                    const unit: AnalUnit = .wrap(.{ .nav_val = nav });
-                    const gop = try units.getOrPut(gpa, unit);
-                    if (!gop.found_existing) {
-                        refs_log.debug("type '{f}': ref named %{}", .{
-                            Type.fromInterned(ty).containerTypeName(ip).fmt(ip),
-                            @backingInt(inst_info.inst),
-                        });
-                        gop.value_ptr.* = referencer;
-                    }
-                }
-            }
+            };
             continue;
         }
         if (unit_idx < units.count()) {
@@ -4436,6 +4481,119 @@ pub fn analysisRoots(zcu: *Zcu) []*Module {
     return zcu.analysis_roots_buffer[0..zcu.analysis_roots_len];
 }
 
+/// `build_options.zir_budget`, unless the `ZIG_ZIR_BUDGET` environment variable (bytes) says
+/// otherwise; see `zir_budget`.
+/// Advanced on every `File.getZir` (single-threaded builds, where eviction runs), to order
+/// eviction least recently used first.
+var zir_clock: u32 = 0;
+
+pub fn defaultZirBudget() usize {
+    if (builtin.link_libc) {
+        if (std.c.getenv("ZIG_ZIR_BUDGET")) |s| {
+            return std.fmt.parseInt(usize, std.mem.span(s), 10) catch build_options.zir_budget;
+        }
+    }
+    return build_options.zir_budget;
+}
+
+pub fn zirBytes(zir: Zir) usize {
+    return zir.instructions.len * (1 + @sizeOf(Zir.Inst.Data)) + zir.extra.len * @sizeOf(u32) + zir.string_bytes.len;
+}
+
+/// Loads `file`'s ZIR back from its ZIR cache file after `evictZir` dropped it. The cache file
+/// must still describe the source `file.stat` describes: the instructions it holds are what
+/// every `TrackedInst` of this file points into. Anything else is fatal -- the callers of
+/// `File.getZir` cannot fail, and there is no correct ZIR to fall back to.
+fn reloadZir(zcu: *const Zcu, file: *File) void {
+    const gpa = zcu.gpa;
+    const io = zcu.comp.io;
+    const entry = file.zir_cache orelse unreachable; // never lowered, or not evictable
+    const dir = if (entry.local) zcu.local_zir_cache else zcu.global_zir_cache;
+    const zir = reload: {
+        const cache_file = dir.handle.openFile(io, &entry.digest, .{ .lock = .shared }) catch |err| break :reload err;
+        defer cache_file.close(io);
+        var buffer: [2000]u8 = undefined;
+        var fr = cache_file.reader(io, &buffer);
+        const header = (fr.interface.takeStructPointer(Zir.Header) catch |err| switch (err) {
+            error.ReadFailed => break :reload fr.err.?,
+            else => |e| break :reload e,
+        }).*;
+        if (header.stat_size != file.stat.size or
+            header.stat_inode != file.stat.inode or
+            header.stat_mtime != file.stat.mtime.nanoseconds)
+        {
+            break :reload error.ZirCacheChanged;
+        }
+        break :reload loadZirCacheBody(gpa, header, &fr.interface) catch |err| switch (err) {
+            error.ReadFailed => fr.err.?,
+            else => |e| e,
+        };
+    } catch |err| std.process.fatal("unable to reload the ZIR of '{f}' from the cache: {t}", .{
+        file.path.fmt(zcu.comp), err,
+    });
+    file.zir = zir;
+    if (build_options.peak_heap) {
+        InternPool.census.zir_reloads += 1;
+        InternPool.census.zir_reload_bytes += zirBytes(zir);
+    }
+}
+
+/// Keeps the loaded ZIR under `zir_budget` by dropping it from the least recently used files
+/// that can get it back (see `File.getZir`). Never under incremental compilation, which maps
+/// old ZIR to new and keeps `prev_zir`, nor with other threads that could be reading it.
+///
+/// `.between_units`: from the main analysis loop, where no frame holds any file's ZIR.
+/// `.within_unit`: before a lazily imported file is lowered, during analysis; files pinned by
+/// a holder up the stack (`File.pinZir`) are kept.
+pub fn evictZir(zcu: *Zcu, when: enum { between_units, within_unit }) Allocator.Error!void {
+    if (!builtin.single_threaded or zcu.zir_budget == 0 or zcu.comp.config.incremental) return;
+    const gpa = zcu.gpa;
+
+    var loaded: usize = 0;
+    for (zcu.import_table.keys()) |file_index| {
+        const zir = zcu.fileByIndex(file_index).zir orelse continue;
+        loaded += zirBytes(zir);
+    }
+    if (loaded <= zcu.zir_budget) return;
+
+    var candidates: std.ArrayList(*File) = .empty;
+    defer candidates.deinit(gpa);
+    for (zcu.import_table.keys()) |file_index| {
+        const file = zcu.fileByIndex(file_index);
+        const zir = file.zir orelse continue;
+        if (file.zir_cache == null or file.status != .success or zir.hasCompileErrors()) continue;
+        switch (when) {
+            .between_units => assert(file.zir_pins == 0),
+            .within_unit => if (file.zir_pins != 0) continue,
+        }
+        try candidates.append(gpa, file);
+    }
+    const clock = zir_clock;
+    std.mem.sort(*File, candidates.items, clock, struct {
+        fn lessThan(now: u32, a: *File, b: *File) bool {
+            // By age, so that the clock wrapping around does not reorder anything.
+            return now -% a.zir_last_use > now -% b.zir_last_use;
+        }
+    }.lessThan);
+    for (candidates.items) |file| {
+        if (loaded <= zcu.zir_budget) break;
+        const bytes = zirBytes(file.zir.?);
+        if (build_options.peak_heap and InternPool.census.poisonEvictedZir()) {
+            // Validation: keep the memory but make any stale read of it visible.
+            const zir = file.zir.?;
+            @memset(@as([*]u8, @ptrCast(zir.instructions.items(.tag).ptr))[0..zir.instructions.len], 0xaa);
+            @memset(std.mem.sliceAsBytes(zir.instructions.items(.data)), 0xaa);
+            @memset(zir.extra, 0xaaaaaaaa);
+            @memset(zir.string_bytes, 0xaa);
+            file.zir = null;
+        } else {
+            file.unloadZir(gpa);
+        }
+        loaded -= bytes;
+        if (build_options.peak_heap) InternPool.census.zir_evictions += 1;
+    }
+}
+
 pub fn fileByIndex(zcu: *const Zcu, file_index: File.Index) *File {
     return zcu.intern_pool.filePtr(file_index);
 }
@@ -4479,8 +4637,8 @@ pub fn typeFileScope(zcu: *Zcu, ty_index: InternPool.Index) *File {
 pub fn navSrcLine(zcu: *Zcu, nav_index: InternPool.Nav.Index) u32 {
     const ip = &zcu.intern_pool;
     const inst_info = ip.getNav(nav_index).srcInst(ip).resolveFull(ip).?;
-    const zir = zcu.fileByIndex(inst_info.file).zir;
-    return zir.?.getDeclaration(inst_info.inst).src_line;
+    const zir = zcu.fileByIndex(inst_info.file).getZir(zcu);
+    return zir.getDeclaration(inst_info.inst).src_line;
 }
 
 pub fn navValue(zcu: *const Zcu, nav_index: InternPool.Nav.Index) Value {

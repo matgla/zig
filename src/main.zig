@@ -4540,7 +4540,8 @@ fn serveUpdateResults(s: *Server, comp: *Compilation) !void {
         for (tr.decl_sema_info.keys(), tr.decl_sema_info.values()) |tracked_inst, sema_info| {
             const resolved = tracked_inst.resolveFull(&comp.zcu.?.intern_pool) orelse continue;
             const file = comp.zcu.?.fileByIndex(resolved.file);
-            const zir = file.zir orelse continue;
+            if (file.zir == null and file.zir_cache == null) continue;
+            const zir = file.getZir(comp.zcu.?);
             const decl_name = zir.nullTerminatedString(zir.getDeclaration(resolved.inst).name);
 
             const gop = try files.getOrPut(gpa, resolved.file);

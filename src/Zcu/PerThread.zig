@@ -347,8 +347,9 @@ pub fn update(
             error.AnalysisFail => {},
         };
         // Every frame that analyzed `unit` has returned, so nothing holds a slice into
-        // storage the pool superseded meanwhile.
+        // storage the pool superseded meanwhile, nor a `Zir` copied out of a `File`.
         zcu.intern_pool.reclaimRetired(gpa);
+        try zcu.evictZir(.between_units);
     }
 }
 fn workerUpdateBuiltinFile(comp: *Compilation, file: *Zcu.File) void {
@@ -558,6 +559,7 @@ pub fn updateFile(
 
     // We're going to re-load everything, so unload source, AST, ZIR, ZOIR.
     file.unload(gpa);
+    file.zir_cache = null;
 
     // We ask for a lock in order to coordinate with other zig processes.
     // If another process is already working on this file, we will get the cached
@@ -621,6 +623,7 @@ pub fn updateFile(
         switch (result) {
             .success => if (!ignore_hit) {
                 log.debug("AstGen cached success: {f}", .{file.path.fmt(comp)});
+                if (file.getMode() == .zig) file.zir_cache = .{ .digest = hex_digest, .local = want_local_cache };
                 break false;
             },
             .invalid => {},
@@ -667,12 +670,14 @@ pub fn updateFile(
         switch (file.getMode()) {
             .zig => {
                 file.zir = try AstGen.generateOptions(gpa, file.tree.?, .{ .strip_tests = strip_tests });
-                Zcu.saveZirCache(gpa, &cache_file_writer, stat, file.zir.?) catch |err| switch (err) {
+                if (Zcu.saveZirCache(gpa, &cache_file_writer, stat, file.zir.?)) {
+                    file.zir_cache = .{ .digest = hex_digest, .local = want_local_cache };
+                } else |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => log.warn("unable to write cached ZIR code for {f} to {f}{s}: {t}", .{
                         file.path.fmt(comp), cache_directory, &hex_digest, err,
                     }),
-                };
+                }
             },
             .zon => {
                 file.zoir = try ZonGen.generate(gpa, file.tree.?, .{});
@@ -1024,7 +1029,8 @@ pub fn ensureFilePopulated(pt: Zcu.PerThread, file_index: Zcu.File.Index) (Alloc
 
     const file = zcu.fileByIndex(file_index);
     assert(file.getMode() == .zig);
-    const struct_decl = file.zir.?.getStructDecl(.main_struct_inst);
+    const struct_decl = file.pinZir(zcu).getStructDecl(.main_struct_inst);
+    defer file.unpinZir();
     const tracked_inst = try ip.trackZir(gpa, io, pt.tid, .{
         .file = file_index,
         .inst = .main_struct_inst,
@@ -1257,7 +1263,8 @@ fn analyzeComptimeUnit(pt: Zcu.PerThread, cu_id: InternPool.ComptimeUnit.Id) Zcu
         return error.AlreadyReported;
     };
     const file = zcu.fileByIndex(inst_resolved.file);
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, null);
     defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
@@ -1394,7 +1401,7 @@ pub fn ensureTypeLayoutUpToDate(
         .pt = pt,
         .gpa = gpa,
         .arena = analysis_arena.allocator(),
-        .code = file.zir.?,
+        .code = file.pinZir(zcu),
         .owner = anal_unit,
         .func_index = .none,
         .func_is_naked = false,
@@ -1402,6 +1409,7 @@ pub fn ensureTypeLayoutUpToDate(
         .fn_ret_ty_ies = null,
         .comptime_err_ret_trace = &comptime_err_ret_trace,
     };
+    defer file.unpinZir();
     defer sema.deinit();
 
     log.debug("ensureTypeLayoutUpToDate {f} (out of date, resolving)", .{zcu.fmtAnalUnit(anal_unit)});
@@ -1506,7 +1514,7 @@ pub fn ensureStructDefaultsUpToDate(
         .pt = pt,
         .gpa = gpa,
         .arena = analysis_arena.allocator(),
-        .code = file.zir.?,
+        .code = file.pinZir(zcu),
         .owner = anal_unit,
         .func_index = .none,
         .func_is_naked = false,
@@ -1514,6 +1522,7 @@ pub fn ensureStructDefaultsUpToDate(
         .fn_ret_ty_ies = null,
         .comptime_err_ret_trace = &comptime_err_ret_trace,
     };
+    defer file.unpinZir();
     defer sema.deinit();
 
     log.debug("ensureStructDefaultsUpToDate {f} (out of date, resolving)", .{zcu.fmtAnalUnit(anal_unit)});
@@ -1656,7 +1665,8 @@ fn analyzeNavVal(
         return error.AlreadyReported;
     };
     const file = zcu.fileByIndex(inst_resolved.file);
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
     const zir_decl = zir.getDeclaration(inst_resolved.inst);
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, reason);
@@ -2024,7 +2034,8 @@ fn analyzeNavType(
         return error.AlreadyReported;
     };
     const file = zcu.fileByIndex(inst_resolved.file);
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, reason);
     defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
@@ -2326,7 +2337,7 @@ fn updateFileRootStructType(pt: Zcu.PerThread, file_index: Zcu.File.Index) Alloc
         // causes `Sema.zirStructType` (or whatever) to call `ensureNamespaceUpToDate`. However,
         // there is no "surrounding declaration" for the root struct type of a Zig source file, so
         // update this namespace now.
-        const decls = file.zir.?.getStructDecl(.main_struct_inst).decls;
+        const decls = file.getZir(zcu).getStructDecl(.main_struct_inst).decls;
         try pt.scanNamespace(loaded_struct.namespace, decls);
         zcu.namespacePtr(loaded_struct.namespace).generation = zcu.generation;
     }
@@ -2497,7 +2508,7 @@ pub fn lazyImportFile(
 
     // Error reporting only considers alive files, so register it before anything can fail.
     const import_tok: Ast.TokenIndex = tok: {
-        const zir = importer.zir.?;
+        const zir = importer.getZir(zcu);
         const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
         const extra = zir.extraData(Zir.Inst.Imports, imports_index);
         var extra_index = extra.end;
@@ -2514,6 +2525,10 @@ pub fn lazyImportFile(
         .module = null,
     } });
     try comp.appendFileSystemInput(file.path);
+
+    // Lowering a new file is when the loaded ZIR grows: make room first, keeping what the
+    // analysis up the stack has pinned.
+    try zcu.evictZir(.within_unit);
 
     pt.updateFile(new.index, file) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -2545,7 +2560,7 @@ pub fn lazyImportFile(
     if (file.status != .success) return error.ImportFailed;
     if (file.getMode() == .zig) {
         // `builtin` modules are otherwise created by `computeAliveFiles` before analysis.
-        const zir = file.zir.?;
+        const zir = file.getZir(zcu);
         const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
         if (imports_index != 0) {
             const extra = zir.extraData(Zir.Inst.Imports, imports_index);
@@ -2721,7 +2736,7 @@ fn computeAliveFiles(pt: Zcu.PerThread) Allocator.Error!bool {
 
         if (file.status != .success) continue; // ZIR not valid if there was a file failure
 
-        const zir = file.zir.?;
+        const zir = file.getZir(zcu);
         const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
         if (imports_index == 0) continue; // this Zig file has no imports
         const extra = zir.extraData(Zir.Inst.Imports, imports_index);
@@ -2895,15 +2910,15 @@ pub fn updateBuiltinModule(pt: Zcu.PerThread, opts: Builtin) Allocator.Error!voi
     try opts.populateFile(gpa, file);
 
     assert(file.status == .success);
-    assert(!file.zir.?.hasCompileErrors());
+    assert(!file.getZir(zcu).hasCompileErrors());
     {
         // Check that it has only one import, which is 'std'.
-        const imports_idx = file.zir.?.extra[@backingInt(Zir.ExtraIndex.imports)];
+        const imports_idx = file.getZir(zcu).extra[@backingInt(Zir.ExtraIndex.imports)];
         assert(imports_idx != 0); // there is an import
-        const extra = file.zir.?.extraData(Zir.Inst.Imports, imports_idx);
+        const extra = file.getZir(zcu).extraData(Zir.Inst.Imports, imports_idx);
         assert(extra.data.imports_len == 1); // there is exactly one import
-        const item = file.zir.?.extraData(Zir.Inst.Imports.Item, extra.end);
-        const import_path = file.zir.?.nullTerminatedString(item.data.name);
+        const item = file.getZir(zcu).extraData(Zir.Inst.Imports.Item, extra.end);
+        const import_path = file.getZir(zcu).nullTerminatedString(item.data.name);
         assert(mem.eql(u8, import_path, "std")); // the single import is of 'std'
     }
 
@@ -3170,6 +3185,7 @@ pub fn scanNamespace(
     namespace.priv_decls.clearRetainingCapacity();
     namespace.comptime_decls.clearRetainingCapacity();
     namespace.test_decls.clearRetainingCapacity();
+    namespace.export_decls.clearRetainingCapacity();
 
     var scan_decl_iter: ScanDeclIter = .{
         .pt = pt,
@@ -3226,7 +3242,7 @@ const ScanDeclIter = struct {
         const gpa = comp.gpa;
         const io = comp.io;
         const file = namespace.fileScope(zcu);
-        const zir = file.zir.?;
+        const zir = file.getZir(zcu);
         const ip = &zcu.intern_pool;
 
         const decl = zir.getDeclaration(decl_inst);
@@ -3322,6 +3338,9 @@ const ScanDeclIter = struct {
                 } else {
                     try namespace.priv_decls.putContext(gpa, nav, {}, .{ .zcu = zcu });
                 }
+                if (decl.linkage == .@"export") {
+                    try namespace.export_decls.append(gpa, .{ .nav = nav, .is_pub = decl.is_pub });
+                }
                 break :a false;
             },
         };
@@ -3353,7 +3372,8 @@ fn analyzeFuncBodyInner(
         ip.getNav(zcu.funcInfo(func.generic_owner).owner_nav).analysis.?;
 
     const file = zcu.fileByIndex(decl_analysis.zir_index.resolveFile(ip));
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, reason);
     defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
@@ -4548,7 +4568,9 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
 
     const inst_info = key.zir_index.resolveFull(ip) orelse return error.LostZirContainerDecl;
     const file = zcu.fileByIndex(inst_info.file);
-    const zir = &file.zir.?;
+    _ = file.pinZir(zcu);
+    defer file.unpinZir();
+    const zir = file.getZirPtr(zcu);
 
     const decls = switch (container) {
         .@"struct" => zir.getStructDecl(inst_info.inst).decls,

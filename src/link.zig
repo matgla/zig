@@ -860,7 +860,7 @@ pub const File = struct {
         {
             const ti = ti_id.resolveFull(&pt.zcu.intern_pool).?;
             const file = pt.zcu.fileByIndex(ti.file);
-            const inst = file.zir.?.instructions.get(@backingInt(ti.inst));
+            const inst = file.getZir(pt.zcu).instructions.get(@backingInt(ti.inst));
             assert(inst.tag == .declaration);
         }
 

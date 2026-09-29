@@ -2585,7 +2585,7 @@ fn initWipNavInner(
     const nav = ip.getNav(nav_index);
     const inst_info = nav.srcInst(ip).resolveFull(ip).?;
     const file = zcu.fileByIndex(inst_info.file);
-    const decl = file.zir.?.getDeclaration(inst_info.inst);
+    const decl = file.getZir(zcu).getDeclaration(inst_info.inst);
     log.debug("initWipNav({s}:{d}:{d} %{d} = {f})", .{
         file.sub_file_path,
         decl.src_line + 1,
@@ -3010,7 +3010,7 @@ fn updateComptimeNavInner(dwarf: *Dwarf, pt: Zcu.PerThread, nav_index: InternPoo
     const inst_info = nav.srcInst(ip).resolveFull(ip).?;
     const nav_val: Value = .fromInterned(nav.resolved.?.value);
     const file = zcu.fileByIndex(inst_info.file);
-    const decl = file.zir.?.getDeclaration(inst_info.inst);
+    const decl = file.getZir(zcu).getDeclaration(inst_info.inst);
     log.debug("updateComptimeNav({s}:{d}:{d} %{d} = {f})", .{
         file.sub_file_path,
         decl.src_line + 1,
@@ -3447,7 +3447,7 @@ fn emitIncompleteContainerType(
     if (name_nav.unwrap()) |nav_index| {
         const nav = ip.getNav(nav_index);
         const decl_inst = nav.srcInst(ip).resolve(ip).?;
-        const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+        const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
         try wip_nav.declCommon(.{
             .decl = .decl_namespace_struct,
             .generic_decl = .generic_decl_const,
@@ -3865,7 +3865,7 @@ fn updateConstInner(dwarf: *Dwarf, pt: Zcu.PerThread, debug_const_index: link.Co
                         assert(!struct_is_file);
                         const nav = ip.getNav(nav_index);
                         const decl_inst = nav.srcInst(ip).resolve(ip).?;
-                        const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+                        const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
                         try wip_nav.declCommon(if (loaded_struct.field_types.len == 0) .{
                             .decl = .decl_namespace_struct,
                             .generic_decl = .generic_decl_const,
@@ -3944,7 +3944,7 @@ fn updateConstInner(dwarf: *Dwarf, pt: Zcu.PerThread, debug_const_index: link.Co
                     const need_terminator: bool = if (loaded_struct.name_nav.unwrap()) |nav_index| t: {
                         const nav = ip.getNav(nav_index);
                         const decl_inst = nav.srcInst(ip).resolve(ip).?;
-                        const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+                        const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
                         try wip_nav.declCommon(.{
                             .decl = .decl_packed_struct,
                             .generic_decl = .generic_decl_const,
@@ -3981,7 +3981,7 @@ fn updateConstInner(dwarf: *Dwarf, pt: Zcu.PerThread, debug_const_index: link.Co
                     const need_terminator: bool = if (loaded_union.name_nav.unwrap()) |nav_index| t: {
                         const nav = ip.getNav(nav_index);
                         const decl_inst = nav.srcInst(ip).resolve(ip).?;
-                        const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+                        const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
                         try wip_nav.declCommon(.{
                             .decl = .decl_union,
                             .generic_decl = .generic_decl_const,
@@ -4043,7 +4043,7 @@ fn updateConstInner(dwarf: *Dwarf, pt: Zcu.PerThread, debug_const_index: link.Co
                     const need_terminator: bool = if (loaded_union.name_nav.unwrap()) |nav_index| t: {
                         const nav = ip.getNav(nav_index);
                         const decl_inst = nav.srcInst(ip).resolve(ip).?;
-                        const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+                        const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
                         try wip_nav.declCommon(.{
                             .decl = .decl_packed_union,
                             .generic_decl = .generic_decl_const,
@@ -4076,7 +4076,7 @@ fn updateConstInner(dwarf: *Dwarf, pt: Zcu.PerThread, debug_const_index: link.Co
                 if (loaded_enum.name_nav.unwrap()) |nav_index| {
                     const nav = ip.getNav(nav_index);
                     const decl_inst = nav.srcInst(ip).resolve(ip).?;
-                    const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+                    const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
                     try wip_nav.declCommon(if (loaded_enum.field_names.len > 0) .{
                         .decl = .decl_enum,
                         .generic_decl = .generic_decl_const,
@@ -4118,7 +4118,7 @@ fn updateConstInner(dwarf: *Dwarf, pt: Zcu.PerThread, debug_const_index: link.Co
             if (loaded_opaque.name_nav.unwrap()) |nav_index| {
                 const nav = ip.getNav(nav_index);
                 const decl_inst = nav.srcInst(ip).resolve(ip).?;
-                const decl = zcu.fileByIndex(file).zir.?.getDeclaration(decl_inst);
+                const decl = zcu.fileByIndex(file).getZir(zcu).getDeclaration(decl_inst);
                 try wip_nav.declCommon(.{
                     .decl = .decl_namespace_struct,
                     .generic_decl = .generic_decl_const,
@@ -4640,13 +4640,13 @@ pub fn updateLineNumber(dwarf: *Dwarf, zcu: *Zcu, zir_index: InternPool.TrackedI
     const inst_info = zir_index.resolveFull(ip).?;
     assert(inst_info.inst != .main_struct_inst);
     const file = zcu.fileByIndex(inst_info.file);
-    const decl = file.zir.?.getDeclaration(inst_info.inst);
+    const decl = file.getZir(zcu).getDeclaration(inst_info.inst);
     log.debug("updateLineNumber({s}:{d}:{d} %{d} = {s})", .{
         file.sub_file_path,
         decl.src_line + 1,
         decl.src_column + 1,
         @backingInt(inst_info.inst),
-        file.zir.?.nullTerminatedString(decl.name),
+        file.getZir(zcu).nullTerminatedString(decl.name),
     });
 
     var line_buf: [4]u8 = undefined;

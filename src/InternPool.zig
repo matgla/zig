@@ -6479,6 +6479,21 @@ pub const census = struct {
     pub var retired_maps: usize = 0;
     /// Bytes of the two above that `reclaimRetired` has since released.
     pub var reclaimed: usize = 0;
+    /// `Zcu.evictZir` / `File.getZir` traffic.
+    pub var zir_evictions: usize = 0;
+    pub var zir_reloads: usize = 0;
+    pub var zir_reload_bytes: usize = 0;
+
+    /// `ZIG_ZIR_POISON_EVICTED` set: `Zcu.evictZir` fills a file's ZIR with 0xaa and keeps the
+    /// memory instead of freeing it, so a `Zir` copy held across an eviction point changes the
+    /// output rather than reading whatever reuses the memory.
+    pub fn poisonEvictedZir() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached == null) S.cached = builtin.link_libc and std.c.getenv("ZIG_ZIR_POISON_EVICTED") != null;
+        return S.cached.?;
+    }
 
     /// `ZIG_IP_POISON_RETIRED` set: `reclaimRetired` fills superseded storage with 0xaa and
     /// keeps it instead of freeing it, so a slice held across a reclaim point changes the
@@ -6524,6 +6539,7 @@ pub const census = struct {
             }
         }
         std.debug.print("ZIR_LIVE files {d} bytes {d} src {d}\n", .{ zir_files, zir_bytes, src_bytes });
+        std.debug.print("ZIR_EVICT evictions {d} reloads {d} reload_bytes {d}\n", .{ zir_evictions, zir_reloads, zir_reload_bytes });
 
         // Each entry of the `maps` list is a hash map that owns its storage outside the
         // flat lists above: one per struct/union/enum/error-set type, sized to that type's
@@ -6610,6 +6626,7 @@ pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
                 namespace.priv_decls.deinit(gpa);
                 namespace.comptime_decls.deinit(gpa);
                 namespace.test_decls.deinit(gpa);
+                namespace.export_decls.deinit(gpa);
             }
         };
         const maps = local.getMutableMaps(gpa, io);
