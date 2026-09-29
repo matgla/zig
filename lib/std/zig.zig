@@ -684,8 +684,15 @@ pub fn putAstErrorsIntoBundle(
 }
 
 pub fn resolveTargetQueryOrFatal(io: Io, target_query: std.Target.Query) std.Target {
+    if (target_query.cpu_arch) |arch| fatalWithoutCpuTables(arch);
     return system.resolveTargetQuery(io, target_query) catch |err|
         std.process.fatal("unable to resolve target: {t}", .{err});
+}
+
+/// A program built with `std.Options.cpu_families` cannot resolve the CPU of other architectures.
+fn fatalWithoutCpuTables(arch: std.Target.Cpu.Arch) void {
+    if (arch.hasCpuTables()) return;
+    std.process.fatal("this compiler was built without support for the '{t}' architecture family", .{arch.family()});
 }
 
 pub fn parseTargetQueryOrReportFatalError(
@@ -699,6 +706,7 @@ pub fn parseTargetQueryOrReportFatalError(
     }
     return std.Target.Query.parse(opts_with_diags) catch |err| switch (err) {
         error.UnknownCpuModel => {
+            fatalWithoutCpuTables(diags.arch.?);
             help: {
                 var help_text = std.array_list.Managed(u8).init(allocator);
                 defer help_text.deinit();
@@ -712,6 +720,7 @@ pub fn parseTargetQueryOrReportFatalError(
             std.process.fatal("unknown CPU: '{s}'", .{diags.cpu_name.?});
         },
         error.UnknownCpuFeature => {
+            fatalWithoutCpuTables(diags.arch.?);
             help: {
                 var help_text = std.array_list.Managed(u8).init(allocator);
                 defer help_text.deinit();

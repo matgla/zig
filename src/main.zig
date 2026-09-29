@@ -56,6 +56,17 @@ pub const std_options: std.Options = .{
     },
 };
 pub const std_options_cwd = if (native_os == .wasi) wasi_cwd else null;
+/// `-Dcpu-family`: a compiler for a microcontroller carries only the CPU tables it targets
+/// (all 31 families are ~200 KB of RAM-resident data).
+pub const std_options_cpu_families: ?[]const std.Target.Cpu.Arch.Family = if (build_options.cpu_families.len == 0) null else families: {
+    var families: [build_options.cpu_families.len]std.Target.Cpu.Arch.Family = undefined;
+    for (&families, build_options.cpu_families) |*family, name| {
+        family.* = std.meta.stringToEnum(std.Target.Cpu.Arch.Family, name) orelse
+            @compileError("unknown architecture family: " ++ name);
+    }
+    const final = families;
+    break :families &final;
+};
 
 pub const panic = crash_report.panic;
 pub const debug = crash_report.debug;

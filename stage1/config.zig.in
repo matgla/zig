@@ -12,6 +12,7 @@ pub const enable_tracy = false;
 pub const value_tracing = false;
 pub const skip_non_native = false;
 pub const debug_gpa = false;
+pub const cpu_families: []const []const u8 = &.{};
 pub const dev = .core;
 pub const io_mode: enum { threaded, evented } = .threaded;
 pub const value_interpret_mode = .direct;

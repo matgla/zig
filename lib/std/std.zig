@@ -232,6 +232,15 @@ pub const Options = struct {
 
     /// Overrides `std.Io.Dir.cwd`.
     pub const cwd: ?fn () Io.Dir = if (@hasDecl(root, "std_options_cwd")) root.std_options_cwd else null;
+
+    /// The CPU architecture families whose feature and model tables are linked into the
+    /// program, or null for all of them. For any other family, `Target.Cpu.Arch.allFeaturesList`
+    /// and `allCpuModels` are empty, and `Target.Cpu.Arch.hasCpuTables` is false. The family the
+    /// program itself is built for is always kept, so the native target always works.
+    pub const cpu_families: ?[]const Target.Cpu.Arch.Family = if (@hasDecl(root, "std_options_cpu_families"))
+        root.std_options_cpu_families
+    else
+        null;
 };
 
 // This forces the start.zig file to be imported, and the comptime logic inside that
