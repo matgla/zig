@@ -17,12 +17,20 @@ flags_for() {
   esac
 }
 
+# fs_* are what the device compiles: freestanding, libc symbols declared extern.
+target_for() {
+  case "$1" in
+    fs_*) echo "thumb-freestanding" ;;
+    *) echo "thumb-linux-musleabi" ;;
+  esac
+}
+
 printf '%-14s %12s %12s %10s %8s %10s\n' program peak_heap peak_usable allocs files status
-for f in c_main bufprint debug_print containers json; do
+for f in c_main bufprint debug_print containers json fs_hello fs_hellofmt; do
   cache="$OUT/cache.$f"
   log="$OUT/$f.log"
   # shellcheck disable=SC2046
-  "$ZIG" build-obj "$SP/corpus/$f.zig" -target thumb-linux-musleabi -mcpu cortex_m33 \
+  "$ZIG" build-obj "$SP/corpus/$f.zig" -target "$(target_for "$f")" -mcpu cortex_m33 \
       -ofmt=c -OReleaseSmall -fno-incremental $(flags_for "$f") \
       --cache-dir "$cache" --global-cache-dir "$cache" -femit-bin="$OUT/$f.c" > "$log" 2>&1
   rc=$?

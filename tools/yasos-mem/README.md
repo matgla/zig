@@ -3,7 +3,11 @@
 The device has 8 MB of PSRAM, so the compiler's peak live heap is the binding
 constraint. `-Dpeak-heap` wraps the root allocator and prints, at exit:
 
-    PEAK_HEAP <bytes> allocs <count>
+    PEAK_HEAP <bytes> allocs <count> usable <bytes>
+
+`usable` is the peak of `malloc_usable_size` over live blocks -- what the C
+allocator actually holds. It used to be well above the requested bytes, because
+`c_allocator` never gave a shrink back; now the two are within 0.2%.
     IP_ARENA <n> IP_LIVE <n> IP_RETIRED <n> IP_MAPS <n> IP_RMAPS <n> IP_SLACK <n>
 
 The second line is an `InternPool` census: how much of the per-thread storage is
@@ -19,7 +23,8 @@ compile leaves through `cleanExit` and never tears the pool down.
     tools/yasos-mem/measure.sh <dir>/bin/zig <label>
 
 Each program compiles `-target thumb-linux-musleabi -mcpu cortex_m33 -ofmt=c
--OReleaseSmall -fno-incremental` into a **fresh cache directory**, so every run is
+-OReleaseSmall -fno-incremental` (`fs_*`: `thumb-freestanding`, which is what the
+device compiles) into a **fresh cache directory**, so every run is
 cold and no arm reuses another's ZIR. `files` counts ZIR cache entries, i.e. how
 many files AstGen actually lowered.
 
@@ -52,3 +57,29 @@ lowers 23: reaching `std.c.write` drags `std/c.zig` (774,682 B of ZIR), which
 pulls `os/linux.zig` (676,617) and `os/linux/syscalls.zig` (472,617). Those three
 are 1.92 MB of the 2.43 MB that `c_main` lowers at all. A YasOS OS tag in
 `std.Target` is the lever there.
+
+## Baselines -- 2026-09-29, branch `mcu-mem`
+
+Peak `malloc_usable_size` bytes, before (295444886) and after this round:
+
+| program | before | after | change |
+|---|---|---|---|
+| c_main | 5,730,048 | 4,607,752 | -19.6% |
+| bufprint | 7,727,984 | 4,977,552 | -35.6% |
+| debug_print | 23,807,352 | 15,643,384 | -34.3% |
+| containers | 5,829,296 | 3,045,520 | -47.8% |
+| json | 7,714,512 | 4,207,144 | -45.5% |
+| fs_hello | 2,657,288 | 1,852,600 | -30.3% |
+| fs_hellofmt | 5,195,504 | 2,980,640 | -42.6% |
+
+From: tests of non-main modules left out of ZIR; link-queue/codegen-pool buffers
+sized for one task when single-threaded; InternPool storage superseded by growth
+freed between analysis units; ZIR instructions exact-size; c_allocator shrinks
+through realloc. The generated C is identical modulo `__N` suffixes.
+
+On the device (QEMU mps3-an524, same kernel/libc/cross, `/proc/mempeak` minus
+the shell; includes the 512 KiB stack and .data): fs_hello 3,845,888 ->
+3,074,304, fs_hellofmt 6,504,192 -> 4,335,872 (also no 256 KiB signal stack).
+
+What is left, for fs_hellofmt: resident ZIR ~50% of peak, and the parse/AstGen
+transient of the file being lowered ~25%.
