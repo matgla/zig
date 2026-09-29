@@ -104,3 +104,27 @@ On the device (same measurement as above, A/B from the same commit):
 | fs_hellofmt | 4,400,640 | 4,137,216 | -263,424 (-6.0%) |
 
 Generated C is byte-identical; compile times unchanged (0.90 / 1.8 s).
+
+## ZIR eviction -- `-Dzir-budget` (c33565d33)
+
+`ZIG_ZIR_BUDGET=<bytes>` overrides the build option at run time. Peak
+`malloc_usable_size` bytes, budget 0 -> 256 KiB (MB of ZIR re-read):
+
+| program | budget 0 | 256 KiB | change | reloaded |
+|---|---|---|---|---|
+| fs_hello | 1,859,072 | 1,490,520 | -20% | 0.3 |
+| fs_hellofmt | 2,987,576 | 2,137,872 | -28% | 5.5 |
+| c_main | 4,614,672 | 3,821,656 | -17% | 5.0 |
+| json | 4,214,896 | 2,769,856 | -34% | 24 |
+| debug_print | 15,664,936 | 10,293,000 | -34% | ~830 (thrashes) |
+
+Below ~256 KiB the peak stops improving; the pinned files and the lowering of
+the file being imported are what is left. Validate with
+`ZIG_ZIR_POISON_EVICTED=1 ZIG_ZIR_BUDGET=1` (evict everything, poison it):
+the C must be byte-identical to budget 0.
+
+On the device (QEMU, `export ZIG_ZIR_BUDGET=...`, `/proc/mempeak` read
+WITHOUT `time` -- under `time` the figure does not move with the budget):
+fs_hello 2,995,968 -> 2,569,984, fs_hellofmt 4,339,456 -> 3,569,408, and five
+fs_hellofmt compiles 13 s -> 8 s. Needs the device ZIR cache to hold ZIR:
+yasos e0f77f0 (64-bit lseek/ftruncate; the cache files had been empty).
