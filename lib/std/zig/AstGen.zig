@@ -260,6 +260,9 @@ pub fn generateOptions(gpa: Allocator, tree: Ast, options: Options) Allocator.Er
 
     try astgen.extra.shrinkToLen(gpa);
     try astgen.string_bytes.shrinkToLen(gpa);
+    // `instructions` was reserved at one per AST node up front, and `toOwnedSlice` hands the
+    // whole capacity to the ZIR, which lives as long as the file does.
+    if (!fatal) astgen.instructions.shrinkAndFree(gpa, astgen.instructions.len);
 
     return .{
         .instructions = if (fatal) .empty else astgen.instructions.toOwnedSlice(),
