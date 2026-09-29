@@ -5850,6 +5850,9 @@ fn zirSwitchContinue(sema: *Sema, start_block: *Block, inst: Zir.Inst.Index) Com
 
 fn zirDbgStmt(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
     if (block.isComptime() or block.ownerModule().strip) return;
+    // A call's or switch's preceding instruction, which is no `dbg_stmt` in ZIR lowered with
+    // `strip_debug` -- a file of a stripped module inlined into a function of one that is not.
+    if (sema.code.instructions.items(.tag)[@backingInt(inst)] != .dbg_stmt) return;
 
     const inst_data = sema.code.instructions.items(.data)[@backingInt(inst)].dbg_stmt;
 

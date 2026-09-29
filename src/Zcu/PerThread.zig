@@ -497,6 +497,10 @@ pub fn updateFile(
     // any other module is lowered without them. For the standard library that is most of what
     // it has: its tests are inline with the code they test.
     const strip_tests = if (file.mod) |mod| mod != zcu.main_mod else false;
+    // A stripped module's Sema drops every debug-only instruction, so they need not exist.
+    // (Under incremental compilation, `strip` can change between updates without the file
+    // changing, which would leave it with ZIR lowered for the old setting.)
+    const strip_debug = if (file.mod) |mod| mod.strip and !zcu.comp.config.incremental else false;
 
     const hex_digest: Cache.HexDigest = d: {
         var h: Cache.HashHelper = .{};
@@ -506,6 +510,7 @@ pub fn updateFile(
         h.add(builtin.zig_backend);
         // The same file lowers differently without its tests, so it is cached apart.
         if (strip_tests) h.addBytes("strip_tests");
+        if (strip_debug) h.addBytes("strip_debug");
         break :d h.final();
     };
 
@@ -669,7 +674,7 @@ pub fn updateFile(
         timer = comp.startTimer();
         switch (file.getMode()) {
             .zig => {
-                file.zir = try AstGen.generateOptions(gpa, file.tree.?, .{ .strip_tests = strip_tests });
+                file.zir = try AstGen.generateOptions(gpa, file.tree.?, .{ .strip_tests = strip_tests, .strip_debug = strip_debug });
                 if (Zcu.saveZirCache(gpa, &cache_file_writer, stat, file.zir.?)) {
                     file.zir_cache = .{ .digest = hex_digest, .local = want_local_cache };
                 } else |err| switch (err) {

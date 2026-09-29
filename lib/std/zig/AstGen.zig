@@ -49,6 +49,8 @@ fn_var_args: bool = false,
 within_fn: bool = false,
 /// See `Options.strip_tests`.
 strip_tests: bool = false,
+/// See `Options.strip_debug`.
+strip_debug: bool = false,
 /// The return type of the current function. This may be a trivial `Ref`, or
 /// otherwise it refers to a `ret_type` instruction.
 fn_ret_ty: Zir.Inst.Ref = .none,
@@ -149,6 +151,13 @@ pub const Options = struct {
     /// run -- because AstGen errors inside a test body are then not reported, and the ZIR must
     /// be cached apart from a full lowering of the same file.
     strip_tests: bool = false,
+    /// Lower no `dbg_stmt` or `dbg_empty_stmt`: line information, which Sema discards for a
+    /// stripped module, the only kind of module a file lowered this way may belong to. The
+    /// ZIR must be cached apart from a full lowering of the same file, and Sema then does not
+    /// find the `dbg_stmt` it otherwise expects right before every call and switch.
+    /// (`dbg_var_ptr`/`dbg_var_val` stay: they also name the types of `const T = struct`
+    /// locals, the `.dbg_var` name strategy.)
+    strip_debug: bool = false,
 };
 
 pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
@@ -170,6 +179,7 @@ pub fn generateOptions(gpa: Allocator, tree: Ast, options: Options) Allocator.Er
         .tree = &tree,
         .nodes_need_rl = &nodes_need_rl,
         .strip_tests = options.strip_tests,
+        .strip_debug = options.strip_debug,
         .src_hasher = undefined, // `structDeclInner` for the root struct will set this
     };
     defer astgen.deinit(gpa);
@@ -6580,7 +6590,7 @@ fn whileExpr(
     if (!continue_scope.endsWithNoReturn()) {
         astgen.advanceSourceCursor(tree.tokenStart(tree.lastToken(then_node)));
         try emitDbgStmt(parent_gz, .{ astgen.source_line - parent_gz.decl_line, astgen.source_column });
-        _ = try parent_gz.add(.{
+        if (!astgen.strip_debug) _ = try parent_gz.add(.{
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = .dbg_empty_stmt,
@@ -6912,7 +6922,7 @@ fn forExpr(
 
     astgen.advanceSourceCursor(tree.tokenStart(tree.lastToken(then_node)));
     try emitDbgStmt(parent_gz, .{ astgen.source_line - parent_gz.decl_line, astgen.source_column });
-    _ = try parent_gz.add(.{
+    if (!astgen.strip_debug) _ = try parent_gz.add(.{
         .tag = .extended,
         .data = .{ .extended = .{
             .opcode = .dbg_empty_stmt,
@@ -13264,7 +13274,7 @@ fn countBodyLenAfterFixupsExtraRefs(astgen: *AstGen, body: []const Zir.Inst.Inde
 }
 
 fn emitDbgStmt(gz: *GenZir, lc: LineColumn) !void {
-    if (gz.is_comptime) return;
+    if (gz.is_comptime or gz.astgen.strip_debug) return;
     if (gz.instructions.items.len > gz.instructions_top) {
         const astgen = gz.astgen;
         const last = gz.instructions.items[gz.instructions.items.len - 1];
@@ -13291,6 +13301,7 @@ fn emitDbgStmt(gz: *GenZir, lc: LineColumn) !void {
 /// instructions; fix up Sema so we don't need it!
 fn emitDbgStmtForceCurrentIndex(gz: *GenZir, lc: LineColumn) !void {
     const astgen = gz.astgen;
+    if (astgen.strip_debug) return;
     if (gz.instructions.items.len > gz.instructions_top and
         @backingInt(gz.instructions.items[gz.instructions.items.len - 1]) == astgen.instructions.len - 1)
     {
