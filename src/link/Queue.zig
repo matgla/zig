@@ -29,7 +29,12 @@ prelink_queue: std.Io.Queue(PrelinkTask),
 zcu_queue: std.Io.Queue(ZcuTask),
 
 /// The capacity of the task queue buffers.
-pub const buffer_size = 512;
+///
+/// This also sizes `Zcu.CodegenTaskPool`, whose slots each hold an `Io.Future` of a whole
+/// `codegen.AnyMir` -- 512 of them are ~320 KB, allocated up front. A single-threaded build
+/// never has more than one in flight: with no concurrency the linker task is not spawned, so
+/// `enqueueZcu` runs each task, and waits for its codegen, before the next one starts.
+pub const buffer_size = if (builtin.single_threaded) 16 else 512;
 
 /// The initial `Queue` state, containing no tasks, expecting no prelink tasks, and with no running worker thread.
 /// The `queued_prelink` field may be appended to before calling `start`.
@@ -218,6 +223,7 @@ fn runIdleTask(comp: *Compilation, tid: Zcu.PerThread.Id) bool {
 }
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
