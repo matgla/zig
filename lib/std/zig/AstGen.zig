@@ -143,10 +143,11 @@ fn appendRefsAssumeCapacity(astgen: *AstGen, refs: []const Zir.Inst.Ref) void {
 }
 
 pub const Options = struct {
-    /// Lower no `test` declarations at all: the ZIR is as if the source had none. Only for a
-    /// file whose tests can never be analyzed -- one outside the main module, since only the
-    /// main module's tests run -- because AstGen errors inside a test body are then not
-    /// reported, and the ZIR must be cached apart from a full lowering of the same file.
+    /// Lower no `test` declarations: the ZIR is as if the source had none, except where a
+    /// function's locals are in scope (see `stripsTestsIn`). Only for a file whose tests can
+    /// never be analyzed -- one outside the main module, since only the main module's tests
+    /// run -- because AstGen errors inside a test body are then not reported, and the ZIR must
+    /// be cached apart from a full lowering of the same file.
     strip_tests: bool = false,
 };
 
@@ -5667,7 +5668,7 @@ fn containerMember(
         },
         .test_decl => {
             // `scanContainer` did not count it either.
-            if (astgen.strip_tests) return .decl;
+            if (astgen.stripsTestsIn(scope)) return .decl;
             const prev_decl_index = wip_decls.index;
             // We need to have *some* decl here so that the decl count matches what's expected.
             // Since it doesn't strictly matter *what* this is, let's save ourselves the trouble
@@ -12885,6 +12886,22 @@ const ScanContainerResult = struct {
 };
 
 /// Detects name conflicts for decls and fields, and populates `namespace.decls` with all named declarations.
+/// Whether `strip_tests` leaves out the `test` declarations of the container whose namespace
+/// is `scope`. Not where a function's locals are in scope: a test may be the only use of one
+/// (`fn Tests(comptime T: type) type { return struct { test { ... T ... } }; }`), and leaving
+/// the test out would make that an "unused" error. Container-level declarations are never
+/// subject to those, so a test with only namespaces above it can go.
+fn stripsTestsIn(astgen: *AstGen, scope: *Scope) bool {
+    if (!astgen.strip_tests) return false;
+    s: switch (scope.unwrap()) {
+        .local_val, .local_ptr => return false,
+        .namespace => |ns| continue :s ns.parent.unwrap(),
+        .gen_zir => |gen_zir| continue :s gen_zir.parent.unwrap(),
+        .defer_normal, .defer_error => |defer_scope| continue :s defer_scope.parent.unwrap(),
+        .top => return true,
+    }
+}
+
 fn scanContainer(
     astgen: *AstGen,
     namespace: *Scope.Namespace,
@@ -12978,7 +12995,7 @@ fn scanContainer(
             },
 
             .test_decl => {
-                if (astgen.strip_tests) {
+                if (astgen.stripsTestsIn(&namespace.base)) {
                     stripped_count += 1;
                     continue;
                 }
