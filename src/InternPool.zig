@@ -287,7 +287,8 @@ pub fn trackZir(
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
-    local.poolRetire(gpa, map.header());
+    const old_map_header = map.header();
+    local.poolRetire(gpa, old_map_header);
     new_map.header().* = .{ .capacity = new_map_capacity };
     @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
     const new_map_mask = new_map.header().mask();
@@ -321,6 +322,7 @@ pub fn trackZir(
     list.appendAssumeCapacity(.{maybe_lost_key});
     map.entries[map_index] = .{ .value = index.toOptional(), .hash = hash };
     shard.shared.tracked_inst_map.release(new_map);
+    local.poolFreeRetiredMap(gpa, old_map_header);
     return index;
 }
 
@@ -383,10 +385,12 @@ pub fn rehashTrackedInsts(
             Map.entries_offset + want_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
-        owner_local.poolRetire(gpa, shard.shared.tracked_inst_map.header());
+        const old_map_header = shard.shared.tracked_inst_map.header();
+        owner_local.poolRetire(gpa, old_map_header);
         new_map.header().* = .{ .capacity = want_capacity };
         @memset(new_map.entries[0..want_capacity], .{ .value = .none, .hash = undefined });
         shard.shared.tracked_inst_map.release(new_map);
+        owner_local.poolFreeRetiredMap(gpa, old_map_header);
     }
 
     // Now, actually insert the items.
@@ -1354,6 +1358,33 @@ const Local = struct {
             return;
         }
         // Not ours: a list or map still on its static `empty` sentinel.
+    }
+
+    /// `base`, a map table `poolRetire`d when the map grew, now that its entries are in the
+    /// grown table and that table is published. Unlike a list, nothing holds on to a map
+    /// table: every reader looks the table up in its shard and is done with it before it
+    /// interns anything. So a single-threaded build frees it here rather than at the next
+    /// `InternPool.reclaimRetired`, where a whole analysis unit's worth of them piled up.
+    fn poolFreeRetiredMap(local: *Local, gpa: Allocator, base: *const anyopaque) void {
+        if (!single_threaded) return;
+        const retired = &local.mutate.retired;
+        var i = retired.items.len;
+        while (i > 0) {
+            i -= 1;
+            const buf = retired.items[i];
+            if (@as(*const anyopaque, buf.ptr) != base) continue;
+            _ = retired.swapRemove(i);
+            if (build_options.peak_heap and census.poisonRetired()) {
+                // Validation: keep the memory but make any stale read of it visible.
+                @memset(buf.ptr[0..buf.len], 0xaa);
+                local.mutate.owned.append(gpa, buf) catch {};
+            } else {
+                gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+            }
+            if (build_options.peak_heap) census.reclaimed += buf.len;
+            return;
+        }
+        // Not retired: it was still the static `empty` sentinel.
     }
 
     /// Releases everything `poolAlloc` handed out. Call once, at teardown.
@@ -7432,7 +7463,8 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
-        local.poolRetire(gpa, map.header());
+        const old_map_header = map.header();
+        local.poolRetire(gpa, old_map_header);
         new_map.header().* = .{ .capacity = new_map_capacity };
         @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
         const new_map_mask = new_map.header().mask();
@@ -7461,6 +7493,7 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
             if (map.entries[map_index].value == .none) break;
         }
         shard.shared.map.release(new_map);
+        local.poolFreeRetiredMap(gpa, old_map_header);
     }
     map.entries[map_index].hash = hash;
     return .{ .new = .{
@@ -11706,7 +11739,8 @@ pub fn getOrPutTrailingString(
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
-    local.poolRetire(gpa, map.header());
+    const old_map_header = map.header();
+    local.poolRetire(gpa, old_map_header);
     new_map.header().* = .{ .capacity = new_map_capacity };
     @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
     const new_map_mask = new_map.header().mask();
@@ -11740,6 +11774,7 @@ pub fn getOrPutTrailingString(
         .hash = hash,
     };
     shard.shared.string_map.release(new_map);
+    local.poolFreeRetiredMap(gpa, old_map_header);
     return value;
 }
 
@@ -12663,7 +12698,8 @@ const GlobalErrorSet = struct {
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
-        local.poolRetire(gpa, map.header());
+        const old_map_header = map.header();
+        local.poolRetire(gpa, old_map_header);
         new_map.header().* = .{ .capacity = new_map_capacity };
         @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
         const new_map_mask = new_map.header().mask();
@@ -12695,6 +12731,7 @@ const GlobalErrorSet = struct {
         const index: GlobalErrorSet.Index = @fromBackingInt(@intCast(mutable_names.mutate.len));
         map.entries[map_index] = .{ .value = index, .hash = hash };
         ges.shared.map.release(new_map);
+        local.poolFreeRetiredMap(gpa, old_map_header);
         return index;
     }
 
