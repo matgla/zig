@@ -301,6 +301,8 @@ analysis_roots_len: usize = 0,
 /// reset to `null` when any semantic analysis occurs (since this invalidates the data).
 /// Allocated into `gpa`.
 resolved_references: ?std.array_hash_map.Auto(AnalUnit, ?ResolvedReference) = null,
+/// The keys of `resolved_references` alone, cached by `referencedUnits`.
+referenced_units: ?UnitSet = null,
 
 /// If `true`, then semantic analysis must not occur on this update due to AstGen errors.
 /// Essentially the entire pipeline after AstGen, including Sema, codegen, and link, is skipped.
@@ -317,9 +319,13 @@ global_assembly: std.array_hash_map.Auto(AnalUnit, []u8) = .empty,
 /// The `next` field on the `Reference` forms a linked list of all references
 /// triggered by the key `AnalUnit`.
 reference_table: std.array_hash_map.Auto(AnalUnit, u32) = .empty,
-all_references: std.ArrayList(Reference) = .empty,
+all_references: ReferenceList = .empty,
 /// Freelist of indices in `all_references`.
 free_references: std.ArrayList(u32) = .empty,
+/// The trace-only part of each `all_references` entry, at the same index. (With `reference_spill`
+/// on, whole references wait in its file instead.)
+reference_cold: std.ArrayList(ReferenceCold) = .empty,
+reference_spill: ReferenceSpill = .{},
 
 inline_reference_frames: std.ArrayList(InlineReferenceFrame) = .empty,
 free_inline_reference_frames: std.ArrayList(InlineReferenceFrame.Index) = .empty,
@@ -333,6 +339,8 @@ type_reference_table: std.array_hash_map.Auto(AnalUnit, u32) = .empty,
 all_type_references: std.ArrayList(TypeReference) = .empty,
 /// Freelist of indices in `all_type_references`.
 free_type_references: std.ArrayList(u32) = .empty,
+/// Set by `freeReferenceEdges`: the tables above are gone, `resolved_references` is final.
+reference_edges_freed: bool = false,
 
 /// Populated by analysis of `AnalUnit.wrap(.{ .memoized_state = s })`, where `s` depends on the element.
 std_lang_decl_values: StdLangDecl.Memoized = .initFill(.none),
@@ -350,6 +358,18 @@ generation: u32 = 0,
 
 /// Only access from the Sema thread.
 anon_name_counter: u32,
+
+/// When nonzero, `evictZir` drops the ZIR of least recently used files while more than this
+/// many bytes of it are loaded; `File.getZir` reloads it from the ZIR cache on demand. For a
+/// device where RAM, not the cache, is what runs out. Set from `build_options.zir_budget`, or
+/// the `ZIG_ZIR_BUDGET` environment variable when linking libc.
+zir_budget: usize = 0,
+/// On top of `zir_budget`: room for the ZIR of files reloaded over and over (`sticky_reloads` or
+/// more times), most reloaded first, which `evictZir` then leaves loaded.  A file bigger than the
+/// budget (std/mem.zig's ZIR is 272 KB) could otherwise never stay, and every reload costs a
+/// device a file open, a lookup and a read: in the RP2350 kernel render std/mem.zig and
+/// std/debug.zig were reloaded ~3900 times.  `zir_budget * 3`, or `ZIG_ZIR_STICKY`.
+zir_sticky: usize = 0,
 
 pub const DependencyReason = struct {
     src: LazySrcLoc,
@@ -803,12 +823,155 @@ pub const CompileLogLine = struct {
     };
 };
 
+/// `Reference`s in fixed chunks: a non-incremental compile keeps every one until analysis ends,
+/// and one growing array of them (12 bytes each) left up to half of its capacity unused and was
+/// copied whole on each growth.
+pub const ReferenceList = struct {
+    chunks: std.ArrayList(*[chunk_len]Reference),
+    len: u32,
+
+    const chunk_len = 2048;
+    pub const empty: ReferenceList = .{ .chunks = .empty, .len = 0 };
+
+    pub fn at(l: *const ReferenceList, i: u32) *Reference {
+        assert(i < l.len);
+        return &l.chunks.items[i / chunk_len][i % chunk_len];
+    }
+
+    fn addOne(l: *ReferenceList, gpa: Allocator) Allocator.Error!u32 {
+        if (l.len == l.chunks.items.len * chunk_len) {
+            try l.chunks.ensureUnusedCapacity(gpa, 1);
+            l.chunks.appendAssumeCapacity(try gpa.create([chunk_len]Reference));
+        }
+        l.len += 1;
+        return l.len - 1;
+    }
+
+    fn deinit(l: *ReferenceList, gpa: Allocator) void {
+        for (l.chunks.items) |chunk| gpa.destroy(chunk);
+        l.chunks.deinit(gpa);
+        l.* = .empty;
+    }
+};
+
+/// Single-threaded, a `Nav` keeps no fully qualified name: `fmtNavFqn` derives it from the
+/// namespace (a generic instance's is its owner's), and `PerThread.navFqn` interns it where a
+/// string is needed, as a type's name. Most scanned declarations are never used, and their
+/// names were 70% of the string bytes of a kernel compile. Multi-threaded, the name is interned
+/// when the namespace is scanned, as upstream.
+pub const lazy_nav_fqn = builtin.single_threaded;
+
+/// Single-threaded and not incremental, a `const`/`var` declaration gets its `Nav` (and tracked
+/// instruction) when it is first looked up instead of when its namespace is scanned: nearly half
+/// the declarations of a kernel compile are never used (`Namespace.DeclSlot`). Another thread
+/// could create the same `Nav`, and incremental updates map existing ones, hence the conditions.
+pub const lazy_decl_navs = builtin.single_threaded;
+
+/// A set of `AnalUnit`s (`referencedUnits`). Built by the spill walk single-threaded, where each
+/// kind of unit is numbered densely, it is a bit per unit by kind instead of a hash map entry.
+pub const UnitSet = struct {
+    dense: bool = false,
+    map: std.array_hash_map.Auto(AnalUnit, void) = .empty,
+    bits: [kinds]std.DynamicBitSetUnmanaged = @splat(.{}),
+
+    const kinds = @typeInfo(AnalUnit.Kind).@"enum".field_names.len;
+    /// Larger ids (none, in practice) go to `map`.
+    const max_dense_id = 1 << 24;
+
+    fn inBits(s: *const UnitSet, unit: AnalUnit) bool {
+        return builtin.single_threaded and s.dense and unit.id < max_dense_id;
+    }
+
+    pub fn contains(s: *const UnitSet, unit: AnalUnit) bool {
+        if (s.inBits(unit)) {
+            const b = &s.bits[@backingInt(unit.kind)];
+            return unit.id < b.bit_length and b.isSet(unit.id);
+        }
+        return s.map.contains(unit);
+    }
+
+    fn put(s: *UnitSet, gpa: Allocator, unit: AnalUnit) Allocator.Error!void {
+        if (s.inBits(unit)) {
+            const b = &s.bits[@backingInt(unit.kind)];
+            if (unit.id >= b.bit_length) try b.resize(gpa, @max(unit.id + 1, b.bit_length + b.bit_length / 2 + 256), false);
+            b.set(unit.id);
+            return;
+        }
+        try s.map.put(gpa, unit, {});
+    }
+
+    /// Every member, for the rare caller that lists them.
+    fn keysAlloc(s: *const UnitSet, gpa: Allocator) Allocator.Error![]AnalUnit {
+        var list: std.ArrayList(AnalUnit) = .empty;
+        errdefer list.deinit(gpa);
+        try list.appendSlice(gpa, s.map.keys());
+        for (s.bits, 0..) |b, kind| {
+            var it = b.iterator(.{});
+            while (it.next()) |id| try list.append(gpa, .{ .kind = @fromBackingInt(@intCast(kind)), .id = @intCast(id) });
+        }
+        return list.toOwnedSlice(gpa);
+    }
+
+    pub fn deinit(s: *UnitSet, gpa: Allocator) void {
+        s.map.deinit(gpa);
+        for (&s.bits) |*b| b.deinit(gpa);
+        s.* = undefined;
+    }
+};
+
+/// A declaration's fully qualified name, without interning it when it is not yet
+/// (`lazy_nav_fqn`): the namespace's name and the declaration's.
+pub fn fmtNavFqn(zcu: *const Zcu, nav: InternPool.Nav.Index) std.fmt.Alt(NavFqn, NavFqn.format) {
+    return .{ .data = .{ .zcu = zcu, .nav = nav } };
+}
+
+/// The namespace a `Nav`'s fully qualified name starts with: its own, or for a generic function
+/// instance its generic owner's. `null` for an extern, named by its name alone.
+fn navFqnNamespace(ip: *const InternPool, nav: InternPool.Nav) ?InternPool.NamespaceIndex {
+    if (nav.analysis) |analysis| return analysis.namespace;
+    const resolved = nav.resolved orelse return null;
+    if (resolved.value == .none) return null;
+    return switch (ip.indexToKey(resolved.value)) {
+        .func => |func| if (func.generic_owner == .none)
+            null
+        else
+            ip.getNav(ip.funcDeclInfo(func.generic_owner).owner_nav).analysis.?.namespace,
+        else => null,
+    };
+}
+
+pub const NavFqn = struct {
+    zcu: *const Zcu,
+    nav: InternPool.Nav.Index,
+
+    pub fn format(d: NavFqn, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ip = &d.zcu.intern_pool;
+        const nav = ip.getNav(d.nav);
+        if (nav.fqn != .empty) return w.print("{f}", .{nav.fqn.fmt(ip)});
+        const namespace = navFqnNamespace(ip, nav) orelse return w.print("{f}", .{nav.name.fmt(ip)});
+        const ns = @constCast(d.zcu).namespacePtr(namespace);
+        const ns_fqn = Type.fromInterned(ns.owner_type).containerTypeName(ip).fqn;
+        if (nav.name == .empty) return w.print("{f}", .{ns_fqn.fmt(ip)});
+        return w.print("{f}.{f}", .{ ns_fqn.fmt(ip), nav.name.fmt(ip) });
+    }
+};
+
 pub const Reference = struct {
-    /// The `AnalUnit` whose semantic analysis was triggered by this reference.
-    referenced: AnalUnit,
+    /// The `AnalUnit` whose semantic analysis was triggered by this reference, as two words
+    /// (`unit`): with `next` a `Reference` is 12 bytes.
+    referenced: [2]u32,
     /// Index into `all_references` of the next `Reference` triggered by the same `AnalUnit`.
     /// `std.math.maxInt(u32)` is the sentinel.
     next: u32,
+    // Where it is and its inline frame are in `reference_cold`.
+
+    pub fn unit(r: Reference) AnalUnit {
+        return @bitCast(r.referenced);
+    }
+};
+
+/// What only reference traces read of a `Reference`.
+pub const ReferenceCold = struct {
     /// The source location of the reference.
     src: LazySrcLoc,
     /// If not `.none`, this is the index of the `InlineReferenceFrame` which should appear
@@ -816,6 +979,34 @@ pub const Reference = struct {
     /// inline calls, which do not create actual references (since they happen in the caller's
     /// `AnalUnit`), but do show in the reference trace.
     inline_frame: InlineReferenceFrame.Index.Optional,
+};
+
+/// One `addUnitReference` / `addTypeReference` as `ReferenceSpill` keeps it.
+pub const SpilledReference = struct {
+    referencer: AnalUnit,
+    /// `.unit`: an `AnalUnit`; `.type`: the `InternPool.Index` of a container type; `.frame`: an
+    /// `InlineReferenceFrame`'s callee (`src` its call_src, `inline_frame` its parent).
+    referenced: u64,
+    src: LazySrcLoc,
+    inline_frame: InlineReferenceFrame.Index.Optional,
+    kind: enum(u8) { unit, type, frame },
+};
+
+/// Without incremental updates, references are only read once analysis is over, and then mostly
+/// to ask which units are referenced at all. With `ZIG_C_SPILL_DIR` set (a device compiler: the SD
+/// card) they go to a file there, in order, instead of `reference_table` and friends:
+/// `referencedUnits` finds the referenced units by passes over the file, and `resolveReferences`
+/// (reference traces, for compile errors) first replays it into the tables.
+pub const ReferenceSpill = struct {
+    state: enum { unopened, off, on } = .unopened,
+    fd: c_int = -1,
+    path: ?[:0]u8 = null,
+    /// Entries in the file; `buf[0..buf_len]` follow them.
+    written: u32 = 0,
+    buf_len: u32 = 0,
+    buf: [64]SpilledReference = undefined,
+    /// `InlineReferenceFrame`s among the records: the next frame's index.
+    frames: u32 = 0,
 };
 
 pub const InlineReferenceFrame = struct {
@@ -866,47 +1057,87 @@ pub const Namespace = struct {
     generation: u32,
     /// Will be a struct, enum, union, or opaque.
     owner_type: InternPool.Index,
-    /// Members of the namespace which are marked `pub`.
-    pub_decls: std.array_hash_map.Custom(InternPool.Nav.Index, void, NavNameContext, true) = .empty,
-    /// Members of the namespace which are *not* marked `pub`.
-    priv_decls: std.array_hash_map.Custom(InternPool.Nav.Index, void, NavNameContext, true) = .empty,
-    /// All `comptime` declarations in this namespace. We store these purely so that incremental
-    /// compilation can re-use the existing `ComptimeUnit`s when a namespace changes.
-    comptime_decls: std.ArrayList(InternPool.ComptimeUnit.Id) = .empty,
-    /// All `test` declarations in this namespace. We store these purely so that incremental
-    /// compilation can re-use the existing `Nav`s when a namespace changes.
-    test_decls: std.ArrayList(InternPool.Nav.Index) = .empty,
+    /// Members of the namespace which are marked `pub`, by name.
+    pub_decls: std.array_hash_map.Auto(InternPool.NullTerminatedString, DeclSlot) = .empty,
+    /// Members of the namespace which are *not* marked `pub`, by name.
+    priv_decls: std.array_hash_map.Auto(InternPool.NullTerminatedString, DeclSlot) = .empty,
+    /// The `comptime`, `test` and `export` declarations, which most namespaces have none of:
+    /// allocated with the first one (`rareLists`).
+    rare: ?*Rare = null,
+
+    pub const Rare = struct {
+        /// All `comptime` declarations in this namespace. We store these purely so that incremental
+        /// compilation can re-use the existing `ComptimeUnit`s when a namespace changes.
+        comptime_decls: std.ArrayList(InternPool.ComptimeUnit.Id) = .empty,
+        /// All `test` declarations in this namespace. We store these purely so that incremental
+        /// compilation can re-use the existing `Nav`s when a namespace changes.
+        test_decls: std.ArrayList(InternPool.Nav.Index) = .empty,
+        /// The members of `pub_decls` and `priv_decls` marked `export`, which `resolveReferences`
+        /// treats as referenced. Recorded when scanning so that finding them does not mean reading
+        /// every declaration's ZIR (and reloading every file `evictZir` dropped).
+        export_decls: std.ArrayList(ExportDecl) = .empty,
+
+        pub fn deinit(rare: *Rare, gpa: Allocator) void {
+            rare.comptime_decls.deinit(gpa);
+            rare.test_decls.deinit(gpa);
+            rare.export_decls.deinit(gpa);
+            gpa.destroy(rare);
+        }
+    };
+
+    pub fn comptimeDecls(ns: *const Namespace) []const InternPool.ComptimeUnit.Id {
+        return if (ns.rare) |rare| rare.comptime_decls.items else &.{};
+    }
+
+    pub fn testDecls(ns: *const Namespace) []const InternPool.Nav.Index {
+        return if (ns.rare) |rare| rare.test_decls.items else &.{};
+    }
+
+    pub fn exportDecls(ns: *const Namespace) []const ExportDecl {
+        return if (ns.rare) |rare| rare.export_decls.items else &.{};
+    }
+
+    pub fn rareLists(ns: *Namespace, gpa: Allocator) Allocator.Error!*Rare {
+        if (ns.rare) |rare| return rare;
+        const rare = try gpa.create(Rare);
+        rare.* = .{};
+        ns.rare = rare;
+        return rare;
+    }
+
+    pub const ExportDecl = struct {
+        nav: InternPool.Nav.Index,
+        is_pub: bool,
+    };
 
     pub const Index = InternPool.NamespaceIndex;
     pub const OptionalIndex = InternPool.OptionalNamespaceIndex;
 
-    const NavNameContext = struct {
-        zcu: *Zcu,
+    /// A named declaration: its `Nav`, or with `lazy_decl_navs` the declaration instruction in
+    /// `file_scope`'s ZIR until something looks it up (`PerThread.declSlotNav`).
+    pub const DeclSlot = enum(u32) {
+        _,
 
-        pub fn hash(ctx: NavNameContext, nav: InternPool.Nav.Index) u32 {
-            const name = ctx.zcu.intern_pool.getNav(nav).name;
-            return std.hash.int(@backingInt(name));
+        const pending_bit: u32 = 1 << 31;
+
+        pub fn fromNav(nav_index: InternPool.Nav.Index) DeclSlot {
+            return @fromBackingInt(@backingInt(nav_index));
         }
 
-        pub fn eql(ctx: NavNameContext, a_nav: InternPool.Nav.Index, b_nav: InternPool.Nav.Index, b_index: usize) bool {
-            _ = b_index;
-            const a_name = ctx.zcu.intern_pool.getNav(a_nav).name;
-            const b_name = ctx.zcu.intern_pool.getNav(b_nav).name;
-            return a_name == b_name;
-        }
-    };
-
-    pub const NameAdapter = struct {
-        zcu: *Zcu,
-
-        pub fn hash(ctx: NameAdapter, s: InternPool.NullTerminatedString) u32 {
-            _ = ctx;
-            return std.hash.int(@backingInt(s));
+        pub fn pending(inst: Zir.Inst.Index) DeclSlot {
+            comptime assert(lazy_decl_navs);
+            return @fromBackingInt(pending_bit | @backingInt(inst));
         }
 
-        pub fn eql(ctx: NameAdapter, a: InternPool.NullTerminatedString, b_nav: InternPool.Nav.Index, b_index: usize) bool {
-            _ = b_index;
-            return a == ctx.zcu.intern_pool.getNav(b_nav).name;
+        /// The declaration instruction of a `Nav` not created yet.
+        pub fn pendingInst(slot: DeclSlot) ?Zir.Inst.Index {
+            if (!lazy_decl_navs or @backingInt(slot) & pending_bit == 0) return null;
+            return @fromBackingInt(@backingInt(slot) & ~pending_bit);
+        }
+
+        pub fn nav(slot: DeclSlot) InternPool.Nav.Index {
+            assert(slot.pendingInst() == null);
+            return @fromBackingInt(@backingInt(slot));
         }
     };
 
@@ -948,7 +1179,8 @@ pub const Namespace = struct {
         name: InternPool.NullTerminatedString,
     ) !InternPool.NullTerminatedString {
         const ns_fqn = Type.fromInterned(ns.owner_type).containerTypeName(ip).fqn;
-        if (name == .empty) return ns_fqn;
+        if (name == .empty) return ns_fqn.asString() orelse
+            ip.getOrPutStringFmt(gpa, io, tid, "{f}", .{ns_fqn.fmt(ip)}, .no_embedded_nulls);
         return ip.getOrPutStringFmt(gpa, io, tid, "{f}.{f}", .{ ns_fqn.fmt(ip), name.fmt(ip) }, .no_embedded_nulls);
     }
 };
@@ -1032,6 +1264,57 @@ pub const File = struct {
     /// we invalidate the corresponding `source_file` dependency, and reset it to `false`.
     zoir_invalidated: bool,
 
+    /// The ZIR cache file `zir` was written to or read from: what lets `Zcu.evictZir` drop the
+    /// ZIR and `getZir` bring it back. `null` if there is none (the cache could not be written).
+    zir_cache: ?ZirCacheEntry = null,
+    /// `zir_clock` when `getZir` last handed out this file's ZIR; eviction is least recent first.
+    zir_last_use: u32 = 0,
+    /// Holders that keep this file's ZIR loaded through `Zcu.evictZir(.within_unit)`; see
+    /// `pinZir`.
+    zir_pins: u32 = 0,
+    /// How often `Zcu.reloadZir` brought this file's ZIR back: `Zcu.zir_sticky` keeps the most
+    /// reloaded loaded.
+    zir_reloads: u32 = 0,
+
+    pub const ZirCacheEntry = struct {
+        digest: Cache.HexDigest,
+        /// `Zcu.local_zir_cache` rather than `Zcu.global_zir_cache`.
+        local: bool,
+    };
+
+    /// This file's ZIR, reloaded from its ZIR cache file if `Zcu.evictZir` dropped it. Every
+    /// read of a successfully lowered file's ZIR during or after semantic analysis goes through
+    /// here; `file.zir` itself is only for AstGen and incremental bookkeeping.
+    pub fn getZir(file: *File, zcu: *const Zcu) Zir {
+        if (file.zir == null) zcu.reloadZir(file);
+        if (builtin.single_threaded) {
+            zir_clock +%= 1;
+            file.zir_last_use = zir_clock;
+        }
+        return file.zir.?;
+    }
+
+    /// `getZir`, and keeps the ZIR loaded until the matching `unpinZir`. Eviction also runs in
+    /// the middle of analysis, before a lazily imported file is lowered (the moment the loaded
+    /// ZIR grows), so anything that holds a file's ZIR across analysis that may import must pin
+    /// it: every `Sema` for the file it analyzes, `Sema.analyzeCall` for the callee's, and the
+    /// functions that set those up.
+    pub fn pinZir(file: *File, zcu: *const Zcu) Zir {
+        const zir = file.getZir(zcu);
+        file.zir_pins += 1;
+        return zir;
+    }
+
+    pub fn unpinZir(file: *File) void {
+        file.zir_pins -= 1;
+    }
+
+    /// Like `getZir`, for a caller that wants to point at it.
+    pub fn getZirPtr(file: *File, zcu: *const Zcu) *const Zir {
+        _ = file.getZir(zcu);
+        return &file.zir.?;
+    }
+
     pub const Path = struct {
         root: enum {
             cwd,
@@ -1092,7 +1375,7 @@ pub const File = struct {
 
     pub fn unloadZir(file: *File, gpa: Allocator) void {
         if (file.zir) |*zir| {
-            zir.deinit(gpa);
+            zir.deinit(zirAllocator(gpa));
             file.zir = null;
         }
     }
@@ -2374,7 +2657,7 @@ pub const LazySrcLoc = struct {
             const resolved_ti = b.inst.resolveFull(ip) orelse return null;
             const file = zcu.fileByIndex(resolved_ti.file);
             const zir = switch (file.getMode()) {
-                .zig => &file.zir.?,
+                .zig => file.getZirPtr(zcu),
                 .zon => {
                     // ZON files don't have ZIR. Instead they will always set their baseline to a
                     // specific dummy value which must resolve to the file's root node.
@@ -2895,7 +3178,105 @@ pub const CompileError = error{
 };
 
 pub fn init(zcu: *Zcu, gpa: Allocator, io: Io, thread_count: usize) !void {
+    zcu.intern_pool.size_hints = readSizeHints();
     try zcu.intern_pool.init(gpa, io, thread_count);
+    if (builtin.single_threaded and builtin.link_libc and zcu.zir_budget != 0) zir_top_gpa = gpa;
+}
+
+/// Single-threaded with a ZIR budget (the device compiler): the ZIR loaded from the ZIR cache
+/// comes from `mmap` with YasOS's `MAP_TOP` -- pages from the top of memory down -- and goes
+/// back with `munmap`. `evictZir` and `File.getZir` drop and load files' ZIR all through a
+/// compile, thousands of blocks of up to a few hundred KB, and without an MMU that churn among
+/// what the compile keeps left free memory in pieces too small for the next block. At the top
+/// it stays apart. (Elsewhere the flag means nothing and `mmap` just maps pages.)
+var zir_top_gpa: ?Allocator = null;
+var zir_top: ZirTop = .{};
+
+/// The allocator for a file's ZIR: `ZirTop` when it is on, which passes what it does not map to
+/// `gpa`, or `gpa` itself.
+pub fn zirAllocator(gpa: Allocator) Allocator {
+    return if (zir_top_gpa != null) zir_top.allocator() else gpa;
+}
+
+const ZirTop = struct {
+    /// The blocks it mapped, to tell them from `gpa`'s.
+    maps: std.ArrayList([]u8) = .empty,
+
+    const min_len = 16 * 1024;
+    const page = 4096;
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(t: *ZirTop) Allocator {
+        return .{ .ptr = t, .vtable = &vtable };
+    }
+
+    fn mapped(t: *ZirTop, ptr: [*]const u8) ?usize {
+        for (t.maps.items, 0..) |m, i| if (m.ptr == ptr) return i;
+        return null;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const t: *ZirTop = @ptrCast(@alignCast(ctx));
+        const gpa = zir_top_gpa.?;
+        if (!builtin.link_libc or len < min_len or alignment.toByteUnits() > page) return gpa.rawAlloc(len, alignment, ra);
+        t.maps.ensureUnusedCapacity(gpa, 1) catch return gpa.rawAlloc(len, alignment, ra);
+        const map_len = std.mem.alignForward(usize, len, page);
+        // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_TOP | MAP_UNINITIALIZED
+        // (YasOS sys/mman.h). The ZIR read from the cache overwrites every byte, so the pages
+        // need not be cleared first -- the kernel still clears what another process had. On the
+        // board that clear, through PSRAM's uncached mirror, was a fifth of a kernel render.
+        const p = std.c.mmap(null, map_len, @bitCast(@as(u32, 0x3)), @bitCast(@as(u32, 0x02 | 0x20 | 0x400000 | 0x4000000)), -1, 0);
+        if (@intFromPtr(p) == std.math.maxInt(usize)) return gpa.rawAlloc(len, alignment, ra);
+        const bytes: [*]u8 = @ptrCast(p);
+        t.maps.appendAssumeCapacity(bytes[0..map_len]);
+        return bytes;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const t: *ZirTop = @ptrCast(@alignCast(ctx));
+        const i = t.mapped(memory.ptr) orelse return zir_top_gpa.?.rawFree(memory, alignment, ra);
+        const m = t.maps.swapRemove(i);
+        if (builtin.link_libc) _ = std.c.munmap(@ptrCast(@alignCast(m.ptr)), m.len);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const t: *ZirTop = @ptrCast(@alignCast(ctx));
+        const i = t.mapped(memory.ptr) orelse return zir_top_gpa.?.rawResize(memory, alignment, new_len, ra);
+        return new_len <= t.maps.items[i].len;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const t: *ZirTop = @ptrCast(@alignCast(ctx));
+        const i = t.mapped(memory.ptr) orelse return zir_top_gpa.?.rawRemap(memory, alignment, new_len, ra);
+        return if (new_len <= t.maps.items[i].len) memory.ptr else null;
+    }
+};
+
+/// `ZIG_IP_HINTS` names a file of `InternPool.SizeHints`: read before the pool is created, and
+/// written with what the pool reached once the compile is done (`writeSizeHints`). A device
+/// compiler's script points it at a file next to the sources; the first compile, without one,
+/// just grows as usual.
+fn readSizeHints() InternPool.SizeHints {
+    if (!builtin.link_libc or !builtin.single_threaded) return .{};
+    const path = std.c.getenv("ZIG_IP_HINTS") orelse return .{};
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return .{};
+    defer _ = std.c.close(fd);
+    var buf: [1024]u8 = undefined;
+    const n = std.c.read(fd, &buf, buf.len);
+    if (n <= 0) return .{};
+    return .parse(buf[0..@intCast(n)]);
+}
+
+pub fn writeSizeHints(zcu: *Zcu) void {
+    if (!builtin.link_libc or !builtin.single_threaded) return;
+    const path = std.c.getenv("ZIG_IP_HINTS") orelse return;
+    var buf: [1024]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{f}", .{InternPool.SizeHints.ofPool(&zcu.intern_pool)}) catch return;
+    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, text.ptr, text.len);
 }
 
 /// It is valid to not call this function before `deinit` in error paths.
@@ -2980,6 +3361,8 @@ pub fn deinit(zcu: *Zcu) void {
         zcu.reference_table.deinit(gpa);
         zcu.all_references.deinit(gpa);
         zcu.free_references.deinit(gpa);
+        zcu.reference_cold.deinit(gpa);
+        zcu.closeReferenceSpill();
 
         zcu.inline_reference_frames.deinit(gpa);
         zcu.free_inline_reference_frames.deinit(gpa);
@@ -2989,6 +3372,7 @@ pub fn deinit(zcu: *Zcu) void {
         zcu.free_type_references.deinit(gpa);
 
         if (zcu.resolved_references) |*r| r.deinit(gpa);
+        if (zcu.referenced_units) |*r| r.deinit(gpa);
 
         if (comp.debugIncremental()) {
             zcu.incremental_debug_state.deinit(gpa);
@@ -3893,7 +4277,9 @@ pub fn resetUnit(zcu: *Zcu, unit: AnalUnit) void {
         var idx = kv.value;
 
         while (idx != std.math.maxInt(u32)) {
-            const ref = zcu.all_references.items[idx];
+            const ref = zcu.all_references.at(idx).*;
+            const ref_inline_frame: InlineReferenceFrame.Index.Optional =
+                if (idx < zcu.reference_cold.items.len) zcu.reference_cold.items[idx].inline_frame else .none;
             zcu.free_references.append(gpa, idx) catch {
                 // This space will be reused eventually, so we need not propagate this error.
                 // Just leak it for now, and let GC reclaim it later on.
@@ -3901,7 +4287,7 @@ pub fn resetUnit(zcu: *Zcu, unit: AnalUnit) void {
             };
             idx = ref.next;
 
-            var opt_inline_frame = ref.inline_frame;
+            var opt_inline_frame = ref_inline_frame;
             while (opt_inline_frame.unwrap()) |inline_frame| {
                 // The same inline frame could be used multiple times by one unit. We need to
                 // detect this case to avoid adding it to `free_inline_reference_frames` more
@@ -3933,6 +4319,21 @@ pub fn resetUnit(zcu: *Zcu, unit: AnalUnit) void {
 }
 
 pub fn addInlineReferenceFrame(zcu: *Zcu, frame: InlineReferenceFrame) Allocator.Error!Zcu.InlineReferenceFrame.Index {
+    // Only reference traces read the frames: with the spill file on they wait there, numbered in
+    // order, and `unspillReferences` puts them back at the same indices.
+    if (zcu.referenceSpillOn() and try zcu.referenceSpillRoom()) {
+        const sp = &zcu.reference_spill;
+        sp.buf[sp.buf_len] = .{
+            .referencer = undefined,
+            .referenced = @backingInt(frame.callee),
+            .src = frame.call_src,
+            .inline_frame = frame.parent,
+            .kind = .frame,
+        };
+        sp.buf_len += 1;
+        sp.frames += 1;
+        return @fromBackingInt(sp.frames - 1);
+    }
     const frame_idx: InlineReferenceFrame.Index = zcu.free_inline_reference_frames.pop() orelse idx: {
         _ = try zcu.inline_reference_frames.addOne(zcu.gpa);
         break :idx @fromBackingInt(@intCast(zcu.inline_reference_frames.items.len - 1));
@@ -3948,35 +4349,185 @@ pub fn addUnitReference(
     ref_src: LazySrcLoc,
     inline_frame: InlineReferenceFrame.Index.Optional,
 ) Allocator.Error!void {
+    zcu.clearCachedResolvedReferences();
+    if (zcu.referenceSpillOn() and try zcu.referenceSpillRoom()) {
+        const sp = &zcu.reference_spill;
+        sp.buf[sp.buf_len] = .{
+            .referencer = src_unit,
+            .referenced = @bitCast(referenced_unit),
+            .src = ref_src,
+            .inline_frame = inline_frame,
+            .kind = .unit,
+        };
+        sp.buf_len += 1;
+        return;
+    }
+    try zcu.insertUnitReference(src_unit, referenced_unit, ref_src, inline_frame);
+}
+
+fn insertUnitReference(
+    zcu: *Zcu,
+    src_unit: AnalUnit,
+    referenced_unit: AnalUnit,
+    ref_src: LazySrcLoc,
+    inline_frame: InlineReferenceFrame.Index.Optional,
+) Allocator.Error!void {
     const gpa = zcu.gpa;
 
-    zcu.clearCachedResolvedReferences();
-
     try zcu.reference_table.ensureUnusedCapacity(gpa, 1);
+    try zcu.reference_cold.ensureUnusedCapacity(gpa, 1);
 
     const ref_idx = zcu.free_references.pop() orelse idx: {
-        _ = try zcu.all_references.addOne(gpa);
-        break :idx zcu.all_references.items.len - 1;
+        break :idx try zcu.all_references.addOne(gpa);
     };
 
     errdefer comptime unreachable;
 
     const gop = zcu.reference_table.getOrPutAssumeCapacity(src_unit);
 
-    zcu.all_references.items[ref_idx] = .{
-        .referenced = referenced_unit,
+    zcu.all_references.at(ref_idx).* = .{
+        .referenced = @bitCast(referenced_unit),
         .next = if (gop.found_existing) gop.value_ptr.* else std.math.maxInt(u32),
-        .src = ref_src,
-        .inline_frame = inline_frame,
     };
+    const cold: ReferenceCold = .{ .src = ref_src, .inline_frame = inline_frame };
+    if (ref_idx == zcu.reference_cold.items.len) {
+        zcu.reference_cold.appendAssumeCapacity(cold);
+    } else {
+        zcu.reference_cold.items[ref_idx] = cold;
+    }
 
     gop.value_ptr.* = @intCast(ref_idx);
 }
 
-pub fn addTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPool.Index, ref_src: LazySrcLoc) Allocator.Error!void {
-    const gpa = zcu.gpa;
+/// Opens the spill file on the first reference, when `ZIG_C_SPILL_DIR` names a directory.
+fn referenceSpillOn(zcu: *Zcu) bool {
+    if (!builtin.link_libc) return false;
+    const sp = &zcu.reference_spill;
+    switch (sp.state) {
+        .on => return true,
+        .off => return false,
+        .unopened => {},
+    }
+    sp.state = .off;
+    if (zcu.comp.config.incremental or zcu.all_references.len != 0 or zcu.all_type_references.items.len != 0 or
+        zcu.inline_reference_frames.items.len != 0) return false;
+    const dir = std.c.getenv("ZIG_C_SPILL_DIR") orelse return false;
+    const path = std.fmt.allocPrintSentinel(zcu.gpa, "{s}/zig-refs-{d}.spill", .{ std.mem.span(dir), std.c.getpid() }, 0) catch return false;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) {
+        zcu.gpa.free(path);
+        return false;
+    }
+    sp.state = .on;
+    sp.fd = fd;
+    sp.path = path;
+    return true;
+}
 
+/// Room in the buffer for one more record. False when writing the file failed: the references
+/// are in the tables again (`unspillReferences`) and the file is gone.
+fn referenceSpillRoom(zcu: *Zcu) Allocator.Error!bool {
+    const sp = &zcu.reference_spill;
+    if (sp.buf_len < sp.buf.len) return true;
+    if (zcu.writeReferenceSpill()) return true;
+    try zcu.unspillReferences();
+    return false;
+}
+
+fn writeReferenceSpill(zcu: *Zcu) bool {
+    if (!builtin.link_libc) unreachable;
+    const sp = &zcu.reference_spill;
+    if (std.c.lseek(sp.fd, @intCast(@as(u64, sp.written) * @sizeOf(SpilledReference)), std.c.SEEK.SET) < 0) return false;
+    var rest: []const u8 = std.mem.sliceAsBytes(sp.buf[0..sp.buf_len]);
+    while (rest.len != 0) {
+        const n = std.c.write(sp.fd, rest.ptr, rest.len);
+        if (n <= 0) return false;
+        rest = rest[@intCast(n)..];
+    }
+    sp.written += sp.buf_len;
+    sp.buf_len = 0;
+    return true;
+}
+
+/// `out.len` records from the file, starting with record `first`.
+fn readReferenceSpill(zcu: *Zcu, out: []SpilledReference, first: u32) void {
+    if (!builtin.link_libc) unreachable;
+    const sp = &zcu.reference_spill;
+    if (std.c.lseek(sp.fd, @intCast(@as(u64, first) * @sizeOf(SpilledReference)), std.c.SEEK.SET) < 0)
+        @panic("the reference spill file cannot be read");
+    var rest: []u8 = std.mem.sliceAsBytes(out);
+    while (rest.len != 0) {
+        const n = std.c.read(sp.fd, rest.ptr, rest.len);
+        if (n <= 0) @panic("the reference spill file cannot be read");
+        rest = rest[@intCast(n)..];
+    }
+}
+
+/// Calls `f(ctx, record)` for every spilled reference, in the order they were added.
+fn forEachSpilledReference(zcu: *Zcu, ctx: anytype, comptime f: anytype) Allocator.Error!void {
+    const sp = &zcu.reference_spill;
+    var chunk: [256]SpilledReference = undefined;
+    var first: u32 = 0;
+    while (first < sp.written) {
+        const n: u32 = @min(chunk.len, sp.written - first);
+        zcu.readReferenceSpill(chunk[0..n], first);
+        for (chunk[0..n]) |r| try f(ctx, r);
+        first += n;
+    }
+    for (sp.buf[0..sp.buf_len]) |r| try f(ctx, r);
+}
+
+/// Back to the tables: replays the spill file in order, then removes it.
+fn unspillReferences(zcu: *Zcu) Allocator.Error!void {
+    if (zcu.reference_spill.state != .on) return;
+    try zcu.forEachSpilledReference(zcu, struct {
+        fn insert(z: *Zcu, r: SpilledReference) Allocator.Error!void {
+            switch (r.kind) {
+                .type => try z.insertTypeReference(r.referencer, @enumFromInt(@as(u32, @intCast(r.referenced))), r.src),
+                .unit => try z.insertUnitReference(r.referencer, @bitCast(r.referenced), r.src, r.inline_frame),
+                .frame => try z.inline_reference_frames.append(z.gpa, .{
+                    .callee = @fromBackingInt(@as(u32, @intCast(r.referenced))),
+                    .call_src = r.src,
+                    .parent = r.inline_frame,
+                }),
+            }
+        }
+    }.insert);
+    zcu.closeReferenceSpill();
+    zcu.reference_spill.state = .off;
+}
+
+fn closeReferenceSpill(zcu: *Zcu) void {
+    if (!builtin.link_libc) return;
+    const sp = &zcu.reference_spill;
+    if (sp.fd >= 0) _ = std.c.close(sp.fd);
+    sp.fd = -1;
+    if (sp.path) |path| {
+        _ = std.c.unlink(path);
+        zcu.gpa.free(path);
+    }
+    sp.path = null;
+}
+
+pub fn addTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPool.Index, ref_src: LazySrcLoc) Allocator.Error!void {
     zcu.clearCachedResolvedReferences();
+    if (zcu.referenceSpillOn() and try zcu.referenceSpillRoom()) {
+        const sp = &zcu.reference_spill;
+        sp.buf[sp.buf_len] = .{
+            .referencer = src_unit,
+            .referenced = @intFromEnum(referenced_type),
+            .src = ref_src,
+            .inline_frame = .none,
+            .kind = .type,
+        };
+        sp.buf_len += 1;
+        return;
+    }
+    try zcu.insertTypeReference(src_unit, referenced_type, ref_src);
+}
+
+fn insertTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPool.Index, ref_src: LazySrcLoc) Allocator.Error!void {
+    const gpa = zcu.gpa;
 
     try zcu.type_reference_table.ensureUnusedCapacity(gpa, 1);
 
@@ -3999,8 +4550,11 @@ pub fn addTypeReference(zcu: *Zcu, src_unit: AnalUnit, referenced_type: InternPo
 }
 
 fn clearCachedResolvedReferences(zcu: *Zcu) void {
+    if (zcu.reference_edges_freed) @panic("a reference was added after freeReferenceEdges");
     if (zcu.resolved_references) |*r| r.deinit(zcu.gpa);
     zcu.resolved_references = null;
+    if (zcu.referenced_units) |*r| r.deinit(zcu.gpa);
+    zcu.referenced_units = null;
 }
 
 pub fn errorSetBits(zcu: *const Zcu) u16 {
@@ -4282,20 +4836,165 @@ pub const ResolvedReference = struct {
 /// This hashmap is cached, so repeated calls to this function are cheap.
 pub fn resolveReferences(zcu: *Zcu) Allocator.Error!*const std.array_hash_map.Auto(AnalUnit, ?ResolvedReference) {
     if (zcu.resolved_references == null) {
-        zcu.resolved_references = try zcu.resolveReferencesInner();
+        zcu.resolved_references = if (zcu.reference_edges_freed) roots: {
+            // Not expected after `freeReferenceEdges` without errors: every unit a root.
+            var units: std.array_hash_map.Auto(AnalUnit, ?ResolvedReference) = .empty;
+            errdefer units.deinit(zcu.gpa);
+            const keys: []AnalUnit = if (zcu.referenced_units) |*r| try r.keysAlloc(zcu.gpa) else &.{};
+            defer zcu.gpa.free(keys);
+            try units.ensureTotalCapacity(zcu.gpa, keys.len);
+            for (keys) |unit| units.putAssumeCapacityNoClobber(unit, null);
+            break :roots units;
+        } else full: {
+            // Reference traces need the tables: spilling ends here (compile errors, usually).
+            try zcu.unspillReferences();
+            break :full try zcu.resolveReferencesInner(?ResolvedReference);
+        };
     }
     return &zcu.resolved_references.?;
 }
-fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(AnalUnit, ?ResolvedReference) {
+
+/// The keys of `resolveReferences`: the referenced `AnalUnit`s, without where from. Cheaper: this
+/// is what `processExports` and a flush need.
+pub fn referencedUnits(zcu: *Zcu) Allocator.Error!*const UnitSet {
+    if (zcu.referenced_units == null) {
+        assert(!zcu.reference_edges_freed);
+        zcu.referenced_units = if (zcu.reference_spill.state == .on)
+            try zcu.referencedUnitsFromSpill()
+        else
+            .{ .map = try zcu.resolveReferencesInner(void) };
+    }
+    return &zcu.referenced_units.?;
+}
+
+/// What `resolveReferencesInner(void)` finds, from the spill file: everything reachable from the
+/// analysis roots. The walk marks what it reaches; passes over the file in order mark the targets
+/// of references from marked units until a pass marks nothing more. The set is the same, only in
+/// a different order -- its users only ask what it contains.
+fn referencedUnitsFromSpill(zcu: *Zcu) Allocator.Error!UnitSet {
+    const gpa = zcu.gpa;
+    var walk: SpillWalk = .{ .zcu = zcu };
+    errdefer walk.units.deinit(gpa);
+    defer walk.types.deinit(gpa);
+
+    for (zcu.analysisRoots()) |mod| {
+        const file = zcu.module_roots.get(mod).?.unwrap() orelse continue;
+        const root_ty = zcu.fileRootType(file);
+        if (root_ty == .none) continue;
+        try walk.markType(root_ty);
+    }
+    while (true) {
+        walk.changed = false;
+        try zcu.forEachSpilledReference(&walk, SpillWalk.follow);
+        if (!walk.changed) break;
+    }
+    return walk.units;
+}
+
+const SpillWalk = struct {
+    zcu: *Zcu,
+    units: UnitSet = .{ .dense = true },
+    types: std.array_hash_map.Auto(InternPool.Index, void) = .empty,
+    changed: bool = false,
+
+    fn follow(w: *SpillWalk, r: SpilledReference) Allocator.Error!void {
+        if (r.kind == .frame or !w.units.contains(r.referencer)) return;
+        if (r.kind == .type) {
+            const ty: InternPool.Index = @enumFromInt(@as(u32, @intCast(r.referenced)));
+            if (w.types.contains(ty)) return;
+            try w.markType(ty);
+        } else {
+            const unit: AnalUnit = @bitCast(r.referenced);
+            if (w.units.contains(unit)) return;
+            try w.markUnit(unit);
+        }
+        w.changed = true;
+    }
+
+    /// With its implicit partner, as `resolveReferencesInner` queues it.
+    fn markUnit(w: *SpillWalk, unit: AnalUnit) Allocator.Error!void {
+        const zcu = w.zcu;
+        const ip = &zcu.intern_pool;
+        try w.units.put(zcu.gpa, unit);
+        const other: AnalUnit = .wrap(switch (unit.unwrap()) {
+            .nav_val => |n| .{ .nav_ty = n },
+            .nav_ty => |n| .{ .nav_val = n },
+            .struct_defaults => |ty| .{ .type_layout = ty },
+            .type_layout => |ty| switch (ip.indexToKey(ty)) {
+                .struct_type => .{ .struct_defaults = ty },
+                .union_type, .enum_type, .opaque_type => return,
+                else => unreachable,
+            },
+            .@"comptime", .func, .memoized_state => return,
+        });
+        try w.units.put(zcu.gpa, other);
+    }
+
+    /// The declarations of the type's namespace that are analyzed without a reference; keep in
+    /// sync with the type case of `resolveReferencesInner`.
+    fn markType(w: *SpillWalk, ty: InternPool.Index) Allocator.Error!void {
+        const zcu = w.zcu;
+        const comp = zcu.comp;
+        const ip = &zcu.intern_pool;
+        try w.types.put(zcu.gpa, ty, {});
+        const ns = zcu.namespacePtr(Type.fromInterned(ty).getNamespace(zcu).unwrap().?);
+        for (ns.comptimeDecls()) |cu| {
+            if (!w.units.contains(.wrap(.{ .@"comptime" = cu }))) try w.markUnit(.wrap(.{ .@"comptime" = cu }));
+        }
+        for (ns.testDecls()) |nav_id| {
+            const nav = ip.getNav(nav_id);
+            const inst_info = nav.analysis.?.zir_index.resolveFull(ip) orelse continue;
+            const file = zcu.fileByIndex(inst_info.file);
+            if (!comp.config.is_test or file.mod != zcu.main_mod) continue;
+            const decl = file.getZir(zcu).getDeclaration(inst_info.inst);
+            const want_analysis = switch (decl.kind) {
+                .@"const", .@"var", .@"comptime" => unreachable,
+                .unnamed_test => true,
+                .@"test", .decltest => a: {
+                    if (comp.test_filters.len > 0) {
+                        const fqn_slice = try std.fmt.allocPrint(zcu.gpa, "{f}", .{zcu.fmtNavFqn(nav_id)});
+                        defer zcu.gpa.free(fqn_slice);
+                        for (comp.test_filters) |test_filter| {
+                            if (std.mem.find(u8, fqn_slice, test_filter) != null) break;
+                        } else break :a false;
+                    }
+                    break :a true;
+                },
+            };
+            if (!want_analysis) continue;
+            if (!w.units.contains(.wrap(.{ .nav_val = nav_id }))) try w.markUnit(.wrap(.{ .nav_val = nav_id }));
+            if (nav.resolved != null and nav.resolved.?.value != .none) {
+                try w.units.put(zcu.gpa, .wrap(.{ .func = nav.resolved.?.value }));
+            }
+        }
+        for (ns.exportDecls()) |exp| {
+            _ = ip.getNav(exp.nav).analysis.?.zir_index.resolveFull(ip) orelse continue;
+            if (!w.units.contains(.wrap(.{ .nav_val = exp.nav }))) try w.markUnit(.wrap(.{ .nav_val = exp.nav }));
+        }
+    }
+};
+
+/// Without incremental updates the flush is the last reader of `referencedUnits`; it lets the set
+/// go before it builds the output, which needs about as much again.
+pub fn dropReferencedUnits(zcu: *Zcu) void {
+    assert(zcu.reference_edges_freed);
+    if (zcu.referenced_units) |*r| r.deinit(zcu.gpa);
+    zcu.referenced_units = null;
+}
+
+/// `V` is `?ResolvedReference`, or `void` for `referencedUnits`.
+fn resolveReferencesInner(zcu: *Zcu, comptime V: type) Allocator.Error!std.array_hash_map.Auto(AnalUnit, V) {
     const trace = tracy.trace(@src());
     defer trace.end();
+    const full = V != void;
+    const root: V = if (full) null else {};
 
     const gpa = zcu.gpa;
     const comp = zcu.comp;
     const ip = &zcu.intern_pool;
 
-    var units: std.array_hash_map.Auto(AnalUnit, ?ResolvedReference) = .empty;
-    var types: std.array_hash_map.Auto(InternPool.Index, ?ResolvedReference) = .empty;
+    var units: std.array_hash_map.Auto(AnalUnit, V) = .empty;
+    var types: std.array_hash_map.Auto(InternPool.Index, V) = .empty;
     defer {
         units.deinit(gpa);
         types.deinit(gpa);
@@ -4309,7 +5008,7 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
         const file = zcu.module_roots.get(mod).?.unwrap() orelse continue;
         const root_ty = zcu.fileRootType(file);
         if (root_ty == .none) continue;
-        types.putAssumeCapacityNoClobber(root_ty, null);
+        types.putAssumeCapacityNoClobber(root_ty, root);
     }
 
     var unit_idx: usize = 0;
@@ -4325,7 +5024,7 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
             // Queue any decls within this type which would be automatically analyzed.
             // Keep in sync with analysis queueing logic in `Zcu.PerThread.ScanDeclIter.scanDecl`.
             const ns = Type.fromInterned(ty).getNamespace(zcu).unwrap().?;
-            for (zcu.namespacePtr(ns).comptime_decls.items) |cu| {
+            for (zcu.namespacePtr(ns).comptimeDecls()) |cu| {
                 // `comptime` decls are always analyzed.
                 const unit: AnalUnit = .wrap(.{ .@"comptime" = cu });
                 const gop = try units.getOrPut(gpa, unit);
@@ -4337,22 +5036,23 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
                     gop.value_ptr.* = referencer;
                 }
             }
-            for (zcu.namespacePtr(ns).test_decls.items) |nav_id| {
+            for (zcu.namespacePtr(ns).testDecls()) |nav_id| {
                 const nav = ip.getNav(nav_id);
                 // `test` declarations are analyzed depending on the test filter.
                 const inst_info = nav.analysis.?.zir_index.resolveFull(ip) orelse continue;
                 const file = zcu.fileByIndex(inst_info.file);
-                const decl = file.zir.?.getDeclaration(inst_info.inst);
-
+                // Before `getZir`: outside a test build that would load each file's ZIR for nothing.
                 if (!comp.config.is_test or file.mod != zcu.main_mod) continue;
+                const decl = file.getZir(zcu).getDeclaration(inst_info.inst);
 
                 const want_analysis = switch (decl.kind) {
                     .@"const", .@"var" => unreachable,
                     .@"comptime" => unreachable,
                     .unnamed_test => true,
                     .@"test", .decltest => a: {
-                        const fqn_slice = nav.fqn.toSlice(ip);
                         if (comp.test_filters.len > 0) {
+                            const fqn_slice = try std.fmt.allocPrint(gpa, "{f}", .{zcu.fmtNavFqn(nav_id)});
+                            defer gpa.free(fqn_slice);
                             for (comp.test_filters) |test_filter| {
                                 if (std.mem.find(u8, fqn_slice, test_filter) != null) break;
                             } else break :a false;
@@ -4378,40 +5078,22 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
                     }
                 }
             }
-            for (zcu.namespacePtr(ns).pub_decls.keys()) |nav| {
-                // These are named declarations. They are analyzed only if marked `export`.
+            // Named declarations are analyzed only if marked `export`: public ones first, then
+            // private, as a walk of `pub_decls` and then `priv_decls` would find them.
+            for ([_]bool{ true, false }) |want_pub| for (zcu.namespacePtr(ns).exportDecls()) |exp| {
+                if (exp.is_pub != want_pub) continue;
+                const nav = exp.nav;
                 const inst_info = ip.getNav(nav).analysis.?.zir_index.resolveFull(ip) orelse continue;
-                const file = zcu.fileByIndex(inst_info.file);
-                const decl = file.zir.?.getDeclaration(inst_info.inst);
-                if (decl.linkage == .@"export") {
-                    const unit: AnalUnit = .wrap(.{ .nav_val = nav });
-                    const gop = try units.getOrPut(gpa, unit);
-                    if (!gop.found_existing) {
-                        refs_log.debug("type '{f}': ref named %{}", .{
-                            Type.fromInterned(ty).containerTypeName(ip).fqn.fmt(ip),
-                            @backingInt(inst_info.inst),
-                        });
-                        gop.value_ptr.* = referencer;
-                    }
+                const unit: AnalUnit = .wrap(.{ .nav_val = nav });
+                const gop = try units.getOrPut(gpa, unit);
+                if (!gop.found_existing) {
+                    refs_log.debug("type '{f}': ref named %{}", .{
+                        Type.fromInterned(ty).containerTypeName(ip).fqn.fmt(ip),
+                        @backingInt(inst_info.inst),
+                    });
+                    gop.value_ptr.* = referencer;
                 }
-            }
-            for (zcu.namespacePtr(ns).priv_decls.keys()) |nav| {
-                // These are named declarations. They are analyzed only if marked `export`.
-                const inst_info = ip.getNav(nav).analysis.?.zir_index.resolveFull(ip) orelse continue;
-                const file = zcu.fileByIndex(inst_info.file);
-                const decl = file.zir.?.getDeclaration(inst_info.inst);
-                if (decl.linkage == .@"export") {
-                    const unit: AnalUnit = .wrap(.{ .nav_val = nav });
-                    const gop = try units.getOrPut(gpa, unit);
-                    if (!gop.found_existing) {
-                        refs_log.debug("type '{f}': ref named %{}", .{
-                            Type.fromInterned(ty).containerTypeName(ip).fqn.fmt(ip),
-                            @backingInt(inst_info.inst),
-                        });
-                        gop.value_ptr.* = referencer;
-                    }
-                }
-            }
+            };
             continue;
         }
         if (unit_idx < units.count()) {
@@ -4443,17 +5125,17 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
                 assert(first_ref_idx != std.math.maxInt(u32));
                 var ref_idx = first_ref_idx;
                 while (ref_idx != std.math.maxInt(u32)) {
-                    const ref = zcu.all_references.items[ref_idx];
-                    const gop = try units.getOrPut(gpa, ref.referenced);
+                    const ref = zcu.all_references.at(ref_idx).*;
+                    const gop = try units.getOrPut(gpa, ref.unit());
                     if (!gop.found_existing) {
                         refs_log.debug("unit '{f}': ref unit '{f}'", .{
                             zcu.fmtAnalUnit(unit),
-                            zcu.fmtAnalUnit(ref.referenced),
+                            zcu.fmtAnalUnit(ref.unit()),
                         });
-                        gop.value_ptr.* = .{
+                        if (full) gop.value_ptr.* = .{
                             .referencer = unit,
-                            .src = ref.src,
-                            .inline_frame = ref.inline_frame,
+                            .src = zcu.reference_cold.items[ref_idx].src,
+                            .inline_frame = zcu.reference_cold.items[ref_idx].inline_frame,
                         };
                     }
                     ref_idx = ref.next;
@@ -4470,7 +5152,7 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
                             zcu.fmtAnalUnit(unit),
                             Type.fromInterned(ref.referenced).containerTypeName(ip).fqn.fmt(ip),
                         });
-                        gop.value_ptr.* = .{
+                        if (full) gop.value_ptr.* = .{
                             .referencer = unit,
                             .src = ref.src,
                             .inline_frame = .none,
@@ -4487,8 +5169,198 @@ fn resolveReferencesInner(zcu: *Zcu) Allocator.Error!std.array_hash_map.Auto(Ana
     return units.move();
 }
 
+/// Without incremental updates nothing is analyzed after `processExports`, and from then on only
+/// the resolved references are read, so the reference tables they came from can go (they are the
+/// largest part of a non-incremental compile's peak, together with the resolved map). Without
+/// compile errors (`any_errors`) the flush wants no more than `referencedUnits`; reference traces
+/// would need `resolveReferences`, which is resolved first when there are errors.
+pub fn freeReferenceEdges(zcu: *Zcu, any_errors: bool) Allocator.Error!void {
+    assert(!zcu.comp.config.incremental);
+    if (zcu.reference_edges_freed) return;
+    if (any_errors) _ = try zcu.resolveReferences() else _ = try zcu.referencedUnits();
+    const gpa = zcu.gpa;
+    zcu.reference_table.deinit(gpa);
+    zcu.all_references.deinit(gpa);
+    zcu.free_references.deinit(gpa);
+    zcu.type_reference_table.deinit(gpa);
+    zcu.all_type_references.deinit(gpa);
+    zcu.free_type_references.deinit(gpa);
+    zcu.reference_cold.deinit(gpa);
+    zcu.closeReferenceSpill();
+    zcu.reference_spill.state = .off;
+    zcu.reference_cold = .empty;
+    zcu.reference_table = .empty;
+    zcu.all_references = .empty;
+    zcu.free_references = .empty;
+    zcu.type_reference_table = .empty;
+    zcu.all_type_references = .empty;
+    zcu.free_type_references = .empty;
+    zcu.reference_edges_freed = true;
+}
+
 pub fn analysisRoots(zcu: *Zcu) []*Module {
     return zcu.analysis_roots_buffer[0..zcu.analysis_roots_len];
+}
+
+/// `build_options.zir_budget`, unless the `ZIG_ZIR_BUDGET` environment variable (bytes) says
+/// otherwise; see `zir_budget`.
+/// Advanced on every `File.getZir` (single-threaded builds, where eviction runs), to order
+/// eviction least recently used first.
+var zir_clock: u32 = 0;
+/// Single-threaded: `File.getZir` reloads since `evictZir` last ran (see `evictZirAfterReloads`).
+var zir_reloads_since_evict: u32 = 0;
+
+/// Reloads that make a file a candidate for `zir_sticky`.
+const sticky_reloads = 16;
+
+/// The sticky allowance: 0 unless `ZIG_ZIR_STICKY` (bytes) says otherwise.  On the Pico
+/// Plus 2 a larger budget beat it: at 1 MB, 512 KB sticky saved 2 s of 606 for 0.8 MB.
+pub fn defaultZirSticky(budget: usize) usize {
+    _ = budget;
+    if (builtin.link_libc) {
+        if (std.c.getenv("ZIG_ZIR_STICKY")) |s| {
+            return std.fmt.parseInt(usize, std.mem.span(s), 10) catch 0;
+        }
+    }
+    return 0;
+}
+
+pub fn defaultZirBudget() usize {
+    if (builtin.link_libc) {
+        if (std.c.getenv("ZIG_ZIR_BUDGET")) |s| {
+            return std.fmt.parseInt(usize, std.mem.span(s), 10) catch build_options.zir_budget;
+        }
+    }
+    return build_options.zir_budget;
+}
+
+pub fn zirBytes(zir: Zir) usize {
+    return zir.instructions.len * (1 + @sizeOf(Zir.Inst.Data)) + zir.extra.len * @sizeOf(u32) + zir.string_bytes.len;
+}
+
+/// Loads `file`'s ZIR back from its ZIR cache file after `evictZir` dropped it. The cache file
+/// must still describe the source `file.stat` describes: the instructions it holds are what
+/// every `TrackedInst` of this file points into. Anything else is fatal -- the callers of
+/// `File.getZir` cannot fail, and there is no correct ZIR to fall back to.
+fn reloadZir(zcu: *const Zcu, file: *File) void {
+    const gpa = zcu.gpa;
+    const io = zcu.comp.io;
+    const entry = file.zir_cache orelse unreachable; // never lowered, or not evictable
+    const dir = if (entry.local) zcu.local_zir_cache else zcu.global_zir_cache;
+    const zir = reload: {
+        const cache_file = dir.handle.openFile(io, &entry.digest, .{ .lock = .shared }) catch |err| break :reload err;
+        defer cache_file.close(io);
+        var buffer: [2000]u8 = undefined;
+        var fr = cache_file.reader(io, &buffer);
+        const header = (fr.interface.takeStructPointer(Zir.Header) catch |err| switch (err) {
+            error.ReadFailed => break :reload fr.err.?,
+            else => |e| break :reload e,
+        }).*;
+        if (header.stat_size != file.stat.size or
+            header.stat_inode != file.stat.inode or
+            header.stat_mtime != file.stat.mtime.nanoseconds)
+        {
+            break :reload error.ZirCacheChanged;
+        }
+        break :reload loadZirCacheBody(zirAllocator(gpa), header, &fr.interface) catch |err| switch (err) {
+            error.ReadFailed => fr.err.?,
+            else => |e| e,
+        };
+    } catch |err| std.process.fatal("unable to reload the ZIR of '{f}' from the cache: {t}", .{
+        file.path.fmt(zcu.comp), err,
+    });
+    file.zir = zir;
+    if (builtin.single_threaded) zir_reloads_since_evict +%= 1;
+    file.zir_reloads +|= 1;
+    if (build_options.peak_heap) {
+        InternPool.census.zir_reloads += 1;
+        InternPool.census.zir_reload_bytes += zirBytes(zir);
+    }
+}
+
+/// Keeps the loaded ZIR under `zir_budget` by dropping it from the least recently used files
+/// that can get it back (see `File.getZir`). Never under incremental compilation, which maps
+/// old ZIR to new and keeps `prev_zir`, nor with other threads that could be reading it.
+///
+/// `.between_units`: from the main analysis loop, where no frame holds any file's ZIR.
+/// `.within_unit`: before a lazily imported file is lowered, during analysis; files pinned by
+/// a holder up the stack (`File.pinZir`) are kept.
+pub fn evictZir(zcu: *Zcu, when: enum { between_units, within_unit }) Allocator.Error!void {
+    if (!builtin.single_threaded or zcu.zir_budget == 0 or zcu.comp.config.incremental) return;
+    const gpa = zcu.gpa;
+    zir_reloads_since_evict = 0;
+
+    var loaded: usize = 0;
+    for (zcu.import_table.keys()) |file_index| {
+        const zir = zcu.fileByIndex(file_index).zir orelse continue;
+        loaded += zirBytes(zir);
+    }
+    if (loaded <= zcu.zir_budget) return;
+
+    var candidates: std.ArrayList(*File) = .empty;
+    defer candidates.deinit(gpa);
+    for (zcu.import_table.keys()) |file_index| {
+        const file = zcu.fileByIndex(file_index);
+        const zir = file.zir orelse continue;
+        if (file.zir_cache == null or file.status != .success or zir.hasCompileErrors()) continue;
+        switch (when) {
+            .between_units => assert(file.zir_pins == 0),
+            .within_unit => if (file.zir_pins != 0) continue,
+        }
+        try candidates.append(gpa, file);
+    }
+    if (zcu.zir_sticky != 0) {
+        // The most reloaded files stay, as long as they fit `zir_sticky`; they do not count
+        // against `zir_budget`.  The sort and the counts are deterministic: so is what stays.
+        std.mem.sort(*File, candidates.items, {}, struct {
+            fn lessThan(_: void, a: *File, b: *File) bool {
+                return a.zir_reloads > b.zir_reloads;
+            }
+        }.lessThan);
+        var sticky: usize = 0;
+        var i: usize = 0;
+        while (i < candidates.items.len) {
+            const file = candidates.items[i];
+            const bytes = zirBytes(file.zir.?);
+            if (file.zir_reloads >= sticky_reloads and sticky + bytes <= zcu.zir_sticky) {
+                sticky += bytes;
+                _ = candidates.orderedRemove(i);
+            } else i += 1;
+        }
+        loaded -= sticky;
+        if (loaded <= zcu.zir_budget) return;
+    }
+    const clock = zir_clock;
+    std.mem.sort(*File, candidates.items, clock, struct {
+        fn lessThan(now: u32, a: *File, b: *File) bool {
+            // By age, so that the clock wrapping around does not reorder anything.
+            return now -% a.zir_last_use > now -% b.zir_last_use;
+        }
+    }.lessThan);
+    for (candidates.items) |file| {
+        if (loaded <= zcu.zir_budget) break;
+        const bytes = zirBytes(file.zir.?);
+        if (build_options.peak_heap and InternPool.census.poisonEvictedZir()) {
+            // Validation: keep the memory but make any stale read of it visible.
+            const zir = file.zir.?;
+            @memset(@as([*]u8, @ptrCast(zir.instructions.items(.tag).ptr))[0..zir.instructions.len], 0xaa);
+            @memset(std.mem.sliceAsBytes(zir.instructions.items(.data)), 0xaa);
+            @memset(zir.extra, 0xaaaaaaaa);
+            @memset(zir.string_bytes, 0xaa);
+            file.zir = null;
+        } else {
+            file.unloadZir(gpa);
+        }
+        loaded -= bytes;
+        if (build_options.peak_heap) InternPool.census.zir_evictions += 1;
+    }
+}
+
+/// `evictZir(.within_unit)` for the points that run often -- after each call, before each
+/// analysis and codegen: the walk over the files only when ZIR was reloaded since it last ran.
+pub fn evictZirAfterReloads(zcu: *Zcu) Allocator.Error!void {
+    if (!builtin.single_threaded or zir_reloads_since_evict == 0) return;
+    try zcu.evictZir(.within_unit);
 }
 
 pub fn fileByIndex(zcu: *const Zcu, file_index: File.Index) *File {
@@ -4534,8 +5406,8 @@ pub fn typeFileScope(zcu: *Zcu, ty_index: InternPool.Index) *File {
 pub fn navSrcLine(zcu: *Zcu, nav_index: InternPool.Nav.Index) u32 {
     const ip = &zcu.intern_pool;
     const inst_info = ip.getNav(nav_index).srcInst(ip).resolveFull(ip).?;
-    const zir = zcu.fileByIndex(inst_info.file).zir;
-    return zir.?.getDeclaration(inst_info.inst).src_line;
+    const zir = zcu.fileByIndex(inst_info.file).getZir(zcu);
+    return zir.getDeclaration(inst_info.inst).src_line;
 }
 
 pub fn navValue(zcu: *const Zcu, nav_index: InternPool.Nav.Index) Value {
@@ -4580,11 +5452,11 @@ fn formatAnalUnit(data: FormatAnalUnit, writer: *Io.Writer) Io.Writer.Error!void
                 return writer.print("comptime(inst=<lost> [{}])", .{@backingInt(cu_id)});
             }
         },
-        .nav_val, .nav_ty => |nav, tag| return writer.print("{t}('{f}' [{}])", .{ tag, ip.getNav(nav).fqn.fmt(ip), @backingInt(nav) }),
+        .nav_val, .nav_ty => |nav, tag| return writer.print("{t}('{f}' [{}])", .{ tag, zcu.fmtNavFqn(nav), @backingInt(nav) }),
         .type_layout, .struct_defaults => |ty, tag| return writer.print("{t}('{f}' [{}])", .{ tag, Type.fromInterned(ty).containerTypeName(ip).fqn.fmt(ip), @backingInt(ty) }),
         .func => |func| {
             const nav = zcu.funcInfo(func).owner_nav;
-            return writer.print("func('{f}' [{}])", .{ ip.getNav(nav).fqn.fmt(ip), @backingInt(func) });
+            return writer.print("func('{f}' [{}])", .{ zcu.fmtNavFqn(nav), @backingInt(func) });
         },
         .memoized_state => return writer.writeAll("memoized_state"),
     }
@@ -4603,16 +5475,14 @@ fn formatDependee(data: FormatDependee, writer: *Io.Writer) Io.Writer.Error!void
             return writer.print("inst('{f}', %{d})", .{ file_path.fmt(zcu.comp), @backingInt(info.inst) });
         },
         .nav_val, .nav_ty => |nav, tag| {
-            const fqn = ip.getNav(nav).fqn;
-            return writer.print("{t}('{f}')", .{ tag, fqn.fmt(ip) });
+            return writer.print("{t}('{f}')", .{ tag, zcu.fmtNavFqn(nav) });
         },
         .type_layout, .struct_defaults => |ip_index, tag| {
             const fqn = Type.fromInterned(ip_index).containerTypeName(ip).fqn;
             return writer.print("{t}('{f}')", .{ tag, fqn.fmt(ip) });
         },
         .func_ies => |ip_index| {
-            const fqn = ip.getNav(ip.indexToKey(ip_index).func.owner_nav).fqn;
-            return writer.print("func_ies('{f}')", .{fqn.fmt(ip)});
+            return writer.print("func_ies('{f}')", .{zcu.fmtNavFqn(ip.indexToKey(ip_index).func.owner_nav)});
         },
         .source_file => |file| {
             const file_path = zcu.fileByIndex(file).path;
@@ -5003,6 +5873,7 @@ fn explainWhyFileIsInModule(
 pub fn addDependencyLoopErrors(zcu: *Zcu, eb: *std.zig.ErrorBundle.Wip) Allocator.Error!void {
     const gpa = zcu.comp.gpa;
 
+    if (zcu.dependency_loops.count() == 0) return;
     const all_references = try zcu.resolveReferences();
 
     var units: std.ArrayList(AnalUnit) = .empty;
@@ -5127,17 +5998,17 @@ fn addDependencyLoopErrorLine(
     } else switch (dep_node.unit.unwrap()) {
         .@"comptime" => unreachable, // cannot be involved in a dependency loop
         .nav_val => |nav| try eb.printString("{f} uses value of declaration '{f}' here", .{
-            fmt_source, ip.getNav(nav).fqn.fmt(ip),
+            fmt_source, zcu.fmtNavFqn(nav),
         }),
         .nav_ty => |nav| try eb.printString("{f} uses type of declaration '{f}' here", .{
-            fmt_source, ip.getNav(nav).fqn.fmt(ip),
+            fmt_source, zcu.fmtNavFqn(nav),
         }),
         .memoized_state => |stage| switch (stage) {
             .panic => try eb.printString("{f} requires panic handler for call here", .{fmt_source}),
             else => try eb.printString("{f} requires 'std.lang' declarations here", .{fmt_source}),
         },
         .func => |func| try eb.printString("{f} uses inferred error set of function '{f}' here", .{
-            fmt_source, ip.getNav(zcu.funcInfo(func).owner_nav).fqn.fmt(ip),
+            fmt_source, zcu.fmtNavFqn(zcu.funcInfo(func).owner_nav),
         }),
         .type_layout => |ty| try eb.printString("{f} depends on type '{f}' {s}", .{
             fmt_source,
@@ -5181,8 +6052,8 @@ fn formatDependencyLoopSourceUnit(data: FormatAnalUnit, w: *Io.Writer) Io.Writer
     const ip = &zcu.intern_pool;
     switch (data.unit.unwrap()) {
         .@"comptime" => unreachable, // cannot be involved in a dependency loop
-        .nav_val => |nav| try w.print("value of declaration '{f}'", .{ip.getNav(nav).fqn.fmt(ip)}),
-        .nav_ty => |nav| try w.print("type of declaration '{f}'", .{ip.getNav(nav).fqn.fmt(ip)}),
+        .nav_val => |nav| try w.print("value of declaration '{f}'", .{zcu.fmtNavFqn(nav)}),
+        .nav_ty => |nav| try w.print("type of declaration '{f}'", .{zcu.fmtNavFqn(nav)}),
         .memoized_state => |stage| switch (stage) {
             .panic => try w.writeAll("panic handler"),
             else => try w.writeAll("'std.lang' declarations"),
@@ -5194,7 +6065,7 @@ fn formatDependencyLoopSourceUnit(data: FormatAnalUnit, w: *Io.Writer) Io.Writer
             Type.fromInterned(ty).containerTypeName(ip).fqn.fmt(ip),
         }),
         .func => |func| try w.print("function '{f}'", .{
-            ip.getNav(zcu.funcInfo(func).owner_nav).fqn.fmt(ip),
+            zcu.fmtNavFqn(zcu.funcInfo(func).owner_nav),
         }),
     }
 }
@@ -5238,10 +6109,15 @@ pub fn populateReferenceTrace(
                 last_call_src = f.call_src;
                 opt_inline_frame = f.parent;
             }
+            var type_name_buf: ?[]u8 = null;
+            defer if (type_name_buf) |buf| gpa.free(buf);
             const root_name: ?[]const u8 = switch (ref.referencer.unwrap()) {
                 .@"comptime" => "comptime",
                 .nav_val, .nav_ty => |nav| ip.getNav(nav).name.toSlice(ip),
-                .type_layout, .struct_defaults => |ty| Type.fromInterned(ty).containerTypeName(ip).fqn.toSlice(ip),
+                .type_layout, .struct_defaults => |ty| name: {
+                    type_name_buf = try std.fmt.allocPrint(gpa, "{f}", .{Type.fromInterned(ty).containerTypeName(ip).fqn.fmt(ip)});
+                    break :name type_name_buf.?;
+                },
                 .func => |f| ip.getNav(zcu.funcInfo(f).owner_nav).name.toSlice(ip),
                 .memoized_state => null,
             };

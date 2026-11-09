@@ -26,6 +26,8 @@ locals: []Local,
 shards: []Shard,
 /// Key is the error name, index is the error tag value. Index 0 has a length-0 string.
 global_error_set: GlobalErrorSet,
+/// Set before `init`: see `SizeHints`.
+size_hints: SizeHints = .{},
 /// Cached number of active bits in a `tid`.
 tid_width: if (single_threaded) u0 else std.math.Log2Int(u32),
 /// Cached shift amount to put a `tid` in the top bits of a 30-bit value.
@@ -96,6 +98,9 @@ dep_entries: std.ArrayList(DepEntry),
 /// Stores unused indices in `dep_entries` which can be reused without a full
 /// garbage collection pass.
 free_dep_entries: std.ArrayList(DepEntry.Index),
+/// Single-threaded, the `linksection` of the few `Nav`s that have one (`Nav.Repr.Bits.has_linksection`)
+/// instead of a word in every `Nav`.
+nav_linksections: std.AutoHashMapUnmanaged(Nav.Index, NullTerminatedString) = .empty,
 
 /// Whether a single-threaded intern pool impl is in use.
 pub const single_threaded = switch (build_options.io_mode) {
@@ -243,10 +248,10 @@ pub fn trackZir(
     var map_mask = map.header().mask();
     var map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
         const index = entry.acquire().unwrap() orelse break;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (std.meta.eql(index.resolveFull(ip) orelse continue, key)) return index;
     }
     shard.mutate.tracked_inst_map.mutex.lock(io, tid);
@@ -257,10 +262,10 @@ pub fn trackZir(
         map_index = hash;
     }
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
         const index = entry.acquire().unwrap() orelse break;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (std.meta.eql(index.resolveFull(ip) orelse continue, key)) return index;
     }
     defer shard.mutate.tracked_inst_map.len += 1;
@@ -268,60 +273,61 @@ pub fn trackZir(
     const list = local.getMutableTrackedInsts(gpa, io);
     try list.ensureUnusedCapacity(1);
     const map_header = map.header().*;
-    if (shard.mutate.tracked_inst_map.len < map_header.capacity * 3 / 5) {
+    if (shard.mutate.tracked_inst_map.len < map_header.capacity / 4 * 3) {
         const entry = &map.entries[map_index];
-        entry.hash = hash;
         const index = (TrackedInst.Index.Unwrapped{
             .tid = tid,
             .index = list.mutate.len,
         }).wrap(ip);
         list.appendAssumeCapacity(.{maybe_lost_key});
-        entry.release(index.toOptional());
+        entry.release(index.toOptional(), hash);
         return index;
     }
-    const arena_state = &local.mutate.arena;
-    var arena = arena_state.promote(gpa);
-    defer arena_state.* = arena.state;
     const new_map_capacity = map_header.capacity * 2;
-    const new_map_buf = try arena.allocator().alignedAlloc(
-        u8,
-        .fromByteUnits(Map.alignment),
+    if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+    const new_map_buf = try local.poolAlloc(
+        gpa,
+        Map.alignment,
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+    const old_map_header = map.header();
+    local.poolRetire(gpa, old_map_header);
     new_map.header().* = .{ .capacity = new_map_capacity };
-    @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
+    @memset(new_map.entries[0..new_map_capacity], .empty);
     const new_map_mask = new_map.header().mask();
     map_index = 0;
     while (map_index < map_header.capacity) : (map_index += 1) {
         const entry = &map.entries[map_index];
-        const index = entry.value.unwrap() orelse continue;
-        const item_hash = entry.hash;
+        const index = entry.get().unwrap() orelse continue;
+        const item_hash = entry.storedHash() orelse h: {
+            const unwrapped = index.unwrap(ip);
+            const maybe_lost = ip.getLocalShared(unwrapped.tid).tracked_insts.acquire().view().items(.@"0")[unwrapped.index];
+            break :h @as(u32, @truncate(Hash.hash(0, std.mem.asBytes(&maybe_lost)) >> 32));
+        };
         var new_map_index = item_hash;
         while (true) : (new_map_index += 1) {
-            new_map_index &= new_map_mask;
+            new_map_index %= new_map_mask;
             const new_entry = &new_map.entries[new_map_index];
-            if (new_entry.value != .none) continue;
-            new_entry.* = .{
-                .value = index.toOptional(),
-                .hash = item_hash,
-            };
+            if (new_entry.get() != .none) continue;
+            new_entry.set(index.toOptional(), item_hash);
             break;
         }
     }
     map = new_map;
     map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= new_map_mask;
-        if (map.entries[map_index].value == .none) break;
+        map_index %= new_map_mask;
+        if (map.entries[map_index].get() == .none) break;
     }
     const index = (TrackedInst.Index.Unwrapped{
         .tid = tid,
         .index = list.mutate.len,
     }).wrap(ip);
     list.appendAssumeCapacity(.{maybe_lost_key});
-    map.entries[map_index] = .{ .value = index.toOptional(), .hash = hash };
+    map.entries[map_index].set(index.toOptional(), hash);
     shard.shared.tracked_inst_map.release(new_map);
+    local.poolFreeRetiredMap(gpa, old_map_header);
     return index;
 }
 
@@ -356,9 +362,9 @@ pub fn rehashTrackedInsts(
         }
     }
 
-    const Map = Shard.Map(TrackedInst.Index.Optional);
+    const Map = @FieldType(@FieldType(Shard, "shared"), "tracked_inst_map");
 
-    const arena_state = &ip.getLocal(tid).mutate.arena;
+    const owner_local = ip.getLocal(tid);
 
     // We know how big each shard must be, so ensure we have the capacity we need.
     for (ip.shards) |*shard| {
@@ -373,21 +379,23 @@ pub fn rehashTrackedInsts(
                 // The map is `.empty` -- we can't memset the entries, or we'll segfault, because
                 // the buffer is secretly constant.
             } else {
-                @memset(shard.shared.tracked_inst_map.entries[0..have_capacity], .{ .value = .none, .hash = undefined });
+                @memset(shard.shared.tracked_inst_map.entries[0..have_capacity], .empty);
             }
             continue;
         }
-        var arena = arena_state.promote(gpa);
-        defer arena_state.* = arena.state;
-        const new_map_buf = try arena.allocator().alignedAlloc(
-            u8,
-            .fromByteUnits(Map.alignment),
+        if (build_options.peak_heap) census.retired_maps += shard.shared.tracked_inst_map.tableBytes();
+        const new_map_buf = try owner_local.poolAlloc(
+            gpa,
+            Map.alignment,
             Map.entries_offset + want_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+        const old_map_header = shard.shared.tracked_inst_map.header();
+        owner_local.poolRetire(gpa, old_map_header);
         new_map.header().* = .{ .capacity = want_capacity };
-        @memset(new_map.entries[0..want_capacity], .{ .value = .none, .hash = undefined });
+        @memset(new_map.entries[0..want_capacity], .empty);
         shard.shared.tracked_inst_map.release(new_map);
+        owner_local.poolFreeRetiredMap(gpa, old_map_header);
     }
 
     // Now, actually insert the items.
@@ -403,7 +411,7 @@ pub fn rehashTrackedInsts(
             const map_mask = map.header().mask();
             var map_index = hash;
             const entry = while (true) : (map_index += 1) {
-                map_index &= map_mask;
+                map_index %= map_mask;
                 const entry = &map.entries[map_index];
                 if (entry.acquire() == .none) break entry;
             };
@@ -411,8 +419,7 @@ pub fn rehashTrackedInsts(
                 .tid = @fromBackingInt(@intCast(local_tid)),
                 .index = @intCast(local_inst_index),
             }, ip);
-            entry.hash = hash;
-            entry.release(index.toOptional());
+            entry.release(index.toOptional(), hash);
         }
     }
 }
@@ -667,13 +674,15 @@ pub const Nav = struct {
     /// 30 bytes.
     const Repr = struct {
         name: NullTerminatedString,
-        fqn: NullTerminatedString,
+        /// Not kept with `Zcu.lazy_nav_fqn`: `Zcu.fmtNavFqn` derives it.
+        fqn: if (Zcu.lazy_nav_fqn) void else NullTerminatedString,
         // The following 2 fields are either both populated, or both `.none`.
         analysis_namespace: OptionalNamespaceIndex,
         analysis_zir_index: TrackedInst.Index.Optional,
         type: InternPool.Index,
         value: InternPool.Index,
-        @"linksection": OptionalNullTerminatedString,
+        /// Single-threaded in `nav_linksections`.
+        @"linksection": if (single_threaded) void else OptionalNullTerminatedString,
         bits: Bits,
 
         const Bits = packed struct(u16) {
@@ -683,13 +692,14 @@ pub const Nav = struct {
             @"threadlocal": bool,
             is_extern_decl: bool,
             want_analysis: bool,
-            _: u1 = 0,
+            /// Single-threaded: the `linksection` is in `nav_linksections`.
+            has_linksection: bool = false,
         };
 
         fn unpack(repr: Repr) Nav {
             return .{
                 .name = repr.name,
-                .fqn = repr.fqn,
+                .fqn = if (Zcu.lazy_nav_fqn) .empty else repr.fqn,
                 .analysis = if (repr.analysis_namespace.unwrap()) |namespace| .{
                     .namespace = namespace,
                     .zir_index = repr.analysis_zir_index.unwrap().?,
@@ -701,7 +711,7 @@ pub const Nav = struct {
                 .resolved = if (repr.type == .none) null else .{
                     .type = repr.type,
                     .@"align" = repr.bits.@"align",
-                    .@"linksection" = repr.@"linksection",
+                    .@"linksection" = if (single_threaded) .none else repr.@"linksection",
                     .@"addrspace" = repr.bits.@"addrspace",
                     .@"const" = repr.bits.@"const",
                     .@"threadlocal" = repr.bits.@"threadlocal",
@@ -718,12 +728,12 @@ pub const Nav = struct {
         // serializing buffers.
         return .{
             .name = nav.name,
-            .fqn = nav.fqn,
+            .fqn = if (Zcu.lazy_nav_fqn) assert(nav.fqn == .empty) else nav.fqn,
             .analysis_namespace = if (nav.analysis) |a| a.namespace.toOptional() else .none,
             .analysis_zir_index = if (nav.analysis) |a| a.zir_index.toOptional() else .none,
             .type = if (nav.resolved) |r| r.type else .none,
             .value = if (nav.resolved) |r| r.value else .none,
-            .@"linksection" = if (nav.resolved) |r| r.@"linksection" else .none,
+            .@"linksection" = if (single_threaded) {} else if (nav.resolved) |r| r.@"linksection" else .none,
             .bits = if (nav.resolved) |r| .{
                 .@"align" = r.@"align",
                 .@"addrspace" = r.@"addrspace",
@@ -731,6 +741,7 @@ pub const Nav = struct {
                 .@"threadlocal" = r.@"threadlocal",
                 .is_extern_decl = r.is_extern_decl,
                 .want_analysis = if (nav.analysis) |a| a.wanted else false,
+                .has_linksection = single_threaded and r.@"linksection" != .none,
             } else .{
                 .@"align" = .none,
                 .@"addrspace" = .generic,
@@ -742,6 +753,60 @@ pub const Nav = struct {
         };
     }
 };
+
+/// A container type's fully qualified name. Multi-threaded it is a string; single-threaded and
+/// not incremental (`Sema.typeFqnWord`) it can instead be the type's name (`same_as_name`), or `derived` from the
+/// type whose namespace the type was declared in: that type's fully qualified name, a dot and
+/// this type's name -- the same text without the string. The type's `fqn` word holds `word`.
+pub const ContainerFqn = struct {
+    word: u32,
+    name: NullTerminatedString,
+
+    const derived_bit: u32 = 1 << 31;
+    pub const same_as_name: u32 = derived_bit | std.math.maxInt(u31);
+
+    pub fn string(s: NullTerminatedString) u32 {
+        return @backingInt(s);
+    }
+
+    pub fn derived(parent: Index) u32 {
+        comptime assert(Zcu.lazy_nav_fqn);
+        return derived_bit | @backingInt(parent);
+    }
+
+    /// The name as one interned string, unless it is derived.
+    pub fn asString(fqn: ContainerFqn) ?NullTerminatedString {
+        if (!Zcu.lazy_nav_fqn or fqn.word & derived_bit == 0) return @fromBackingInt(fqn.word);
+        return null;
+    }
+
+    pub fn fmt(fqn: ContainerFqn, ip: *const InternPool) std.fmt.Alt(Formatter, Formatter.format) {
+        return .{ .data = .{ .fqn = fqn, .ip = ip } };
+    }
+
+    pub const Formatter = struct {
+        fqn: ContainerFqn,
+        ip: *const InternPool,
+
+        pub fn format(f: Formatter, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            if (f.fqn.asString()) |s| return w.print("{f}", .{s.fmt(f.ip)});
+            if (f.fqn.word == same_as_name) return w.print("{f}", .{f.fqn.name.fmt(f.ip)});
+            const parent: Index = @fromBackingInt(f.fqn.word & ~derived_bit);
+            return w.print("{f}.{f}", .{ f.ip.containerFqn(parent).fmt(f.ip), f.fqn.name.fmt(f.ip) });
+        }
+    };
+};
+
+/// The fully qualified name of a struct, union, enum or opaque type.
+pub fn containerFqn(ip: *const InternPool, ty: Index) ContainerFqn {
+    return switch (ip.indexToKey(ty)) {
+        .struct_type => ip.loadStructType(ty).fqn,
+        .union_type => ip.loadUnionType(ty).fqn,
+        .enum_type => ip.loadEnumType(ty).fqn,
+        .opaque_type => ip.loadOpaqueType(ty).fqn,
+        else => unreachable,
+    };
+}
 
 pub const Dependee = union(enum) {
     src_hash: TrackedInst.Index,
@@ -972,7 +1037,19 @@ const Local = struct {
         /// so it must remain valid.
         /// This arena's lifetime is tied to that of `Compilation`, although it can be cleared on
         /// garbage collection (currently vaporware).
+        /// Unused in single-threaded builds; see `owned`.
         arena: std.heap.ArenaAllocator.State,
+        /// A single-threaded build has no GPA contention to avoid, so it takes those buffers
+        /// straight from the GPA and records them here instead. What this drops is the arena's
+        /// node growth, which stranded 24-42% of everything it handed out.
+        owned: if (single_threaded) Owned else void,
+        /// Single-threaded only: buffers superseded by a grown copy, moved here from `owned`.
+        /// They are NOT freed on the spot -- callers legitimately hold slices into superseded
+        /// storage across further interning (see the `field_types`/`field_offsets` loop in
+        /// `codegen.zig`) -- but at the next `InternPool.reclaimRetired`, which runs where no
+        /// such slice can be live: between top-level analysis units. Without this they were
+        /// kept to teardown, and were about as large as the live storage itself.
+        retired: if (single_threaded) Owned else void,
 
         items: ListMutate,
         extra: ListMutate,
@@ -1062,7 +1139,7 @@ const Local = struct {
             const Mutable = struct {
                 gpa: Allocator,
                 io: Io,
-                arena: *std.heap.ArenaAllocator.State,
+                local: *Local,
                 mutate: *ListMutate,
                 list: *ListSelf,
 
@@ -1204,17 +1281,22 @@ const Local = struct {
                     const old_capacity = mutable.list.header().capacity;
                     if (old_capacity >= total_capacity) return;
                     var new_capacity = old_capacity;
-                    while (new_capacity < total_capacity) new_capacity = (new_capacity + 10) * 2;
+                    // Single-threaded (the device compiler) a quarter more at a time: doubling left
+                    // up to half of the largest lists unused. The outgrown storage is reclaimed
+                    // between units (`reclaimRetired`), so more growth steps cost copies, not memory.
+                    while (new_capacity < total_capacity) new_capacity = if (single_threaded)
+                        new_capacity + new_capacity / 4 + 64
+                    else
+                        (new_capacity + 10) * 2;
                     try mutable.setCapacity(new_capacity);
                 }
 
                 fn setCapacity(mutable: Mutable, capacity: u32) Allocator.Error!void {
                     const io = mutable.io;
-                    var arena = mutable.arena.promote(mutable.gpa);
-                    defer mutable.arena.* = arena.state;
-                    const buf = try arena.allocator().alignedAlloc(
-                        u8,
-                        .fromByteUnits(alignment),
+                    if (build_options.peak_heap) census.retired_lists += mutable.list.bufferBytes();
+                    const buf = try mutable.local.poolAlloc(
+                        mutable.gpa,
+                        alignment,
                         bytes_offset + View.capacityInBytes(capacity),
                     );
                     var new_list: ListSelf = .{ .bytes = @ptrCast(buf[bytes_offset..].ptr) };
@@ -1227,9 +1309,13 @@ const Local = struct {
                         const new_slice = new_list.view().slice();
                         inline for (fields) |field| @memcpy(new_slice.items(field)[0..len], old_slice.items(field)[0..len]);
                     }
-                    mutable.mutate.mutex.lockUncancelable(io);
-                    defer mutable.mutate.mutex.unlock(io);
-                    mutable.list.release(new_list);
+                    const old_list = mutable.list.*;
+                    {
+                        mutable.mutate.mutex.lockUncancelable(io);
+                        defer mutable.mutate.mutex.unlock(io);
+                        mutable.list.release(new_list);
+                    }
+                    mutable.local.poolRetire(mutable.gpa, old_list.header());
                 }
 
                 pub fn viewAllowEmpty(mutable: Mutable) View {
@@ -1277,6 +1363,13 @@ const Local = struct {
             fn header(list: ListSelf) *Header {
                 return @ptrCast(@alignCast(list.bytes - bytes_offset));
             }
+            /// Bytes this list's current buffer occupies, 0 for the static empty
+            /// sentinel. Used by the `-Dpeak-heap` census.
+            pub fn bufferBytes(list: ListSelf) usize {
+                const capacity = list.header().capacity;
+                if (capacity == 0) return 0;
+                return bytes_offset + View.capacityInBytes(capacity);
+            }
             pub fn view(list: ListSelf) View {
                 const capacity = list.header().capacity;
                 assert(capacity > 0); // optimizes `MultiArrayList.Slice.items`
@@ -1289,11 +1382,100 @@ const Local = struct {
         };
     }
 
+    const OwnedBuf = struct {
+        ptr: [*]u8,
+        len: usize,
+        alignment: std.mem.Alignment,
+    };
+    const Owned = std.ArrayListUnmanaged(OwnedBuf);
+
+    /// Long-lived `InternPool` storage: from the GPA and remembered when single-threaded,
+    /// from `arena` otherwise. Never reused or freed before teardown either way.
+    fn poolAlloc(
+        local: *Local,
+        gpa: Allocator,
+        comptime buf_alignment: usize,
+        n: usize,
+    ) Allocator.Error![]align(buf_alignment) u8 {
+        if (!single_threaded) {
+            var arena = local.mutate.arena.promote(gpa);
+            defer local.mutate.arena = arena.state;
+            return arena.allocator().alignedAlloc(u8, .fromByteUnits(buf_alignment), n);
+        }
+        try local.mutate.owned.ensureUnusedCapacity(gpa, 1);
+        const buf = try gpa.alignedAlloc(u8, .fromByteUnits(buf_alignment), n);
+        local.mutate.owned.appendAssumeCapacity(.{
+            .ptr = buf.ptr,
+            .len = buf.len,
+            .alignment = .fromByteUnits(buf_alignment),
+        });
+        return buf;
+    }
+
+    /// `base`, the start of a buffer `poolAlloc` returned, has been superseded by a grown copy.
+    /// Single-threaded, it is released at the next `InternPool.reclaimRetired`; otherwise it
+    /// stays in the arena like everything else.
+    fn poolRetire(local: *Local, gpa: Allocator, base: *const anyopaque) void {
+        if (!single_threaded) return;
+        const owned = &local.mutate.owned;
+        for (owned.items, 0..) |buf, i| {
+            if (@as(*const anyopaque, buf.ptr) != base) continue;
+            // Best effort: if `retired` cannot grow, the buffer just stays owned to teardown.
+            local.mutate.retired.append(gpa, buf) catch return;
+            _ = owned.swapRemove(i);
+            return;
+        }
+        // Not ours: a list or map still on its static `empty` sentinel.
+    }
+
+    /// `base`, a map table `poolRetire`d when the map grew, now that its entries are in the
+    /// grown table and that table is published. Unlike a list, nothing holds on to a map
+    /// table: every reader looks the table up in its shard and is done with it before it
+    /// interns anything. So a single-threaded build frees it here rather than at the next
+    /// `InternPool.reclaimRetired`, where a whole analysis unit's worth of them piled up.
+    fn poolFreeRetiredMap(local: *Local, gpa: Allocator, base: *const anyopaque) void {
+        if (!single_threaded) return;
+        const retired = &local.mutate.retired;
+        var i = retired.items.len;
+        while (i > 0) {
+            i -= 1;
+            const buf = retired.items[i];
+            if (@as(*const anyopaque, buf.ptr) != base) continue;
+            _ = retired.swapRemove(i);
+            if (build_options.peak_heap and census.poisonRetired()) {
+                // Validation: keep the memory but make any stale read of it visible.
+                @memset(buf.ptr[0..buf.len], 0xaa);
+                local.mutate.owned.append(gpa, buf) catch {};
+            } else {
+                gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+            }
+            if (build_options.peak_heap) census.reclaimed += buf.len;
+            return;
+        }
+        // Not retired: it was still the static `empty` sentinel.
+    }
+
+    /// Releases everything `poolAlloc` handed out. Call once, at teardown.
+    fn poolFree(local: *Local, gpa: Allocator) void {
+        if (!single_threaded) {
+            local.mutate.arena.promote(gpa).deinit();
+            return;
+        }
+        for (local.mutate.owned.items) |buf| {
+            gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+        }
+        local.mutate.owned.deinit(gpa);
+        for (local.mutate.retired.items) |buf| {
+            gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+        }
+        local.mutate.retired.deinit(gpa);
+    }
+
     pub fn getMutableItems(local: *Local, gpa: Allocator, io: Io) List(Item).Mutable {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.items,
             .list = &local.shared.items,
         };
@@ -1303,7 +1485,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.extra,
             .list = &local.shared.extra,
         };
@@ -1319,7 +1501,7 @@ const Local = struct {
             @sizeOf(u64) => .{
                 .gpa = gpa,
                 .io = io,
-                .arena = &local.mutate.arena,
+                .local = local,
                 .mutate = &local.mutate.limbs,
                 .list = &local.shared.limbs,
             },
@@ -1332,7 +1514,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.strings,
             .list = &local.shared.strings,
         };
@@ -1347,7 +1529,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.string_bytes,
             .list = &local.shared.string_bytes,
         };
@@ -1359,7 +1541,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.tracked_insts,
             .list = &local.shared.tracked_insts,
         };
@@ -1376,7 +1558,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.files,
             .list = &local.shared.files,
         };
@@ -1391,7 +1573,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.maps,
             .list = &local.shared.maps,
         };
@@ -1401,7 +1583,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.navs,
             .list = &local.shared.navs,
         };
@@ -1411,7 +1593,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.comptime_units,
             .list = &local.shared.comptime_units,
         };
@@ -1431,7 +1613,7 @@ const Local = struct {
         return .{
             .gpa = gpa,
             .io = io,
-            .arena = &local.mutate.arena,
+            .local = local,
             .mutate = &local.mutate.namespaces.buckets_list,
             .list = &local.shared.namespaces,
         };
@@ -1448,9 +1630,9 @@ pub fn getLocalShared(ip: *const InternPool, tid: Zcu.PerThread.Id) *const Local
 
 const Shard = struct {
     shared: struct {
-        map: Map(Index),
-        string_map: Map(OptionalNullTerminatedString),
-        tracked_inst_map: Map(TrackedInst.Index.Optional),
+        map: Map(Index, single_threaded),
+        string_map: Map(OptionalNullTerminatedString, single_threaded),
+        tracked_inst_map: Map(TrackedInst.Index.Optional, single_threaded),
     } align(std.atomic.cache_line),
     mutate: struct {
         // TODO: measure cost of sharing unrelated mutate state
@@ -1521,7 +1703,10 @@ const Shard = struct {
         };
     };
 
-    fn Map(comptime Value: type) type {
+    /// `packed_hash`: single-threaded, each entry keeps the top 4 bits of the hash beside a
+    /// 28-bit value -- 4 bytes instead of 8 (the tables were the largest part of a device compile
+    /// after the lists) -- and a growing table recomputes the hashes from the keys.
+    fn Map(comptime Value: type, comptime packed_hash: bool) type {
         comptime assert(@typeInfo(Value).@"enum".tag_type == u32);
         _ = @as(Value, .none); // expected .none key
         return struct {
@@ -1534,7 +1719,7 @@ const Shard = struct {
                 entries: [1]Entry,
             }{
                 .header = .{ .capacity = 1 },
-                .entries = .{.{ .value = .none, .hash = undefined }},
+                .entries = .{Entry.empty},
             }).entries) };
 
             const alignment = @max(@alignOf(Header), @alignOf(Entry));
@@ -1551,28 +1736,88 @@ const Shard = struct {
             const Header = extern struct {
                 capacity: u32,
 
+                /// Probes wrap with `%`, so any capacity works: the tables sized from the
+                /// size hints are not rounded up to a power of two.
                 fn mask(head: *const Header) u32 {
-                    assert(std.math.isPowerOfTwo(head.capacity));
-                    return head.capacity - 1;
+                    return head.capacity;
                 }
             };
             fn header(map: @This()) *Header {
                 return @ptrCast(@alignCast(@as([*]u8, @ptrCast(map.entries)) - entries_offset));
             }
+            /// Bytes this map's current table occupies. Used by the `-Dpeak-heap` census.
+            pub fn tableBytes(map: @This()) usize {
+                return entries_offset + map.header().capacity * @sizeOf(Entry);
+            }
 
-            const Entry = extern struct {
+            const Entry = if (packed_hash) PackedEntry else FullEntry;
+
+            const FullEntry = extern struct {
                 value: Value,
                 hash: u32,
 
-                fn acquire(entry: *const Entry) Value {
+                const empty: FullEntry = .{ .value = .none, .hash = undefined };
+
+                fn acquire(entry: *const FullEntry) Value {
                     return @atomicLoad(Value, &entry.value, .acquire);
                 }
-                fn release(entry: *Entry, value: Value) void {
+                /// The value, read with the mutex held.
+                fn get(entry: *const FullEntry) Value {
+                    return entry.value;
+                }
+                fn hashMatches(entry: *const FullEntry, hash: u32) bool {
+                    return entry.hash == hash;
+                }
+                fn storedHash(entry: *const FullEntry) ?u32 {
+                    return entry.hash;
+                }
+                fn release(entry: *FullEntry, value: Value, hash: u32) void {
                     assert(value != .none);
+                    entry.hash = hash;
                     @atomicStore(Value, &entry.value, value, .release);
                 }
-                fn resetUnordered(entry: *Entry) void {
+                /// For a table no other thread can see yet.
+                fn set(entry: *FullEntry, value: Value, hash: u32) void {
+                    entry.* = .{ .value = value, .hash = hash };
+                }
+                fn resetUnordered(entry: *FullEntry) void {
                     @atomicStore(Value, &entry.value, .none, .unordered);
+                }
+            };
+
+            const PackedEntry = extern struct {
+                word: u32,
+
+                const value_bits = 28;
+                const value_mask: u32 = (1 << value_bits) - 1;
+                const none_word: u32 = std.math.maxInt(u32);
+                const empty: PackedEntry = .{ .word = none_word };
+
+                fn acquire(entry: *const PackedEntry) Value {
+                    return entry.get();
+                }
+                fn get(entry: *const PackedEntry) Value {
+                    if (entry.word == none_word) return .none;
+                    return @fromBackingInt(entry.word & value_mask);
+                }
+                fn hashMatches(entry: *const PackedEntry, hash: u32) bool {
+                    return entry.word >> value_bits == hash >> value_bits;
+                }
+                fn storedHash(entry: *const PackedEntry) ?u32 {
+                    _ = entry;
+                    return null;
+                }
+                fn release(entry: *PackedEntry, value: Value, hash: u32) void {
+                    assert(value != .none);
+                    entry.set(value, hash);
+                }
+                fn set(entry: *PackedEntry, value: Value, hash: u32) void {
+                    const v: u32 = @backingInt(value);
+                    if (v >= value_mask) @panic("InternPool: a value too large for a packed map entry");
+                    entry.word = (hash >> value_bits) << value_bits | v;
+                }
+                fn resetUnordered(entry: *PackedEntry) void {
+                    entry.word = none_word;
                 }
             };
         };
@@ -1861,6 +2106,11 @@ pub const NullTerminatedString = enum(u32) {
         return @backingInt(a) < @backingInt(b);
     }
 
+    /// `indexLessThan` as a three-way comparison, for searching a sorted run.
+    pub fn indexOrder(key: NullTerminatedString, mid: NullTerminatedString) std.math.Order {
+        return std.math.order(@backingInt(key), @backingInt(mid));
+    }
+
     pub fn toUnsigned(string: NullTerminatedString, ip: *const InternPool) ?u32 {
         const slice = string.toSlice(ip);
         if (slice.len > 1 and slice[0] == '0') return null;
@@ -2036,14 +2286,22 @@ pub const Key = union(enum) {
     pub const ErrorSetType = struct {
         /// Set of error names, sorted by null terminated string index.
         names: NullTerminatedString.Slice,
-        /// This is ignored by `get` but will always be provided by `indexToKey`.
-        names_map: OptionalMapIndex = .none,
 
         /// Look up field index based on field name.
+        ///
+        /// `names` is sorted by `NullTerminatedString.indexLessThan` (both constructors
+        /// assert it) and the hash map this used to consult compared names by integer
+        /// value alone, so a binary search answers exactly the same question without a
+        /// map per error set -- and `error{X}` is by far the most common error set there
+        /// is.
         pub fn nameIndex(self: ErrorSetType, ip: *const InternPool, name: NullTerminatedString) ?u32 {
-            const map = self.names_map.unwrap().?.get(ip);
-            const adapter: NullTerminatedString.Adapter = .{ .strings = self.names.get(ip) };
-            const field_index = map.getIndexAdapted(name, adapter) orelse return null;
+            const names = self.names.get(ip);
+            const field_index = std.sort.binarySearch(
+                NullTerminatedString,
+                names,
+                name,
+                NullTerminatedString.indexOrder,
+            ) orelse return null;
             return @intCast(field_index);
         }
     };
@@ -3210,7 +3468,7 @@ pub const LoadedStructType = struct {
     /// The name of this struct type.
     name: NullTerminatedString,
     /// The fully-qualified name of this struct type.
-    fqn: NullTerminatedString,
+    fqn: ContainerFqn,
     /// If this is a declared type with the `.parent` name strategy, this is the `Nav` it was named after.
     /// Otherwise, or if this is a file's root struct type, this is `.none`.
     name_nav: Nav.Index.Optional,
@@ -3394,7 +3652,7 @@ pub const LoadedUnionType = struct {
     /// The name of this union type.
     name: NullTerminatedString,
     /// The fully-qualified name of this union type.
-    fqn: NullTerminatedString,
+    fqn: ContainerFqn,
     /// If this is a declared type with the `.parent` name strategy, this is the `Nav` it was named after.
     /// Otherwise, this is `.none`.
     name_nav: Nav.Index.Optional,
@@ -3462,7 +3720,7 @@ pub const LoadedEnumType = struct {
     /// The name of this enum type.
     name: NullTerminatedString,
     /// The fully-qualified name of this enum type.
-    fqn: NullTerminatedString,
+    fqn: ContainerFqn,
     /// If this is a declared type with the `.parent` name strategy, this is the `Nav` it was named after.
     /// Otherwise, this is `.none`.
     name_nav: Nav.Index.Optional,
@@ -3525,7 +3783,7 @@ pub const LoadedOpaqueType = struct {
     /// The name of this opaque type.
     name: NullTerminatedString,
     /// The fully-qualified name of this opaque type.
-    fqn: NullTerminatedString,
+    fqn: ContainerFqn,
     /// If this is a declared type with the `.parent` name strategy, this is the `Nav` it was named after.
     /// Otherwise, this is `.none`.
     name_nav: Nav.Index.Optional,
@@ -3611,7 +3869,7 @@ pub fn loadStructType(ip: *const InternPool, index: Index) LoadedStructType {
                 .captures = captures,
                 .is_reified = extra.data.flags.any_captures == .reified,
                 .name = extra.data.name,
-                .fqn = extra.data.fqn,
+                .fqn = .{ .word = @backingInt(extra.data.fqn), .name = extra.data.name },
                 .name_nav = extra.data.name_nav,
                 .namespace = extra.data.namespace,
                 .layout = switch (extra.data.flags.layout) {
@@ -3675,7 +3933,7 @@ pub fn loadStructType(ip: *const InternPool, index: Index) LoadedStructType {
         .captures = captures,
         .is_reified = extra.data.bits.captures_len == .reified,
         .name = extra.data.name,
-        .fqn = extra.data.fqn,
+        .fqn = .{ .word = @backingInt(extra.data.fqn), .name = extra.data.name },
         .name_nav = extra.data.name_nav,
         .namespace = extra.data.namespace,
         .layout = .@"packed",
@@ -3751,7 +4009,7 @@ pub fn loadUnionType(ip: *const InternPool, index: Index) LoadedUnionType {
                 .captures = captures,
                 .is_reified = extra.data.flags.any_captures == .reified,
                 .name = extra.data.name,
-                .fqn = extra.data.fqn,
+                .fqn = .{ .word = @backingInt(extra.data.fqn), .name = extra.data.name },
                 .name_nav = extra.data.name_nav,
                 .namespace = extra.data.namespace,
                 .layout = switch (extra.data.flags.layout) {
@@ -3807,7 +4065,7 @@ pub fn loadUnionType(ip: *const InternPool, index: Index) LoadedUnionType {
         .captures = captures,
         .is_reified = extra.data.bits.captures_len == .reified,
         .name = extra.data.name,
-        .fqn = extra.data.fqn,
+        .fqn = .{ .word = @backingInt(extra.data.fqn), .name = extra.data.name },
         .name_nav = extra.data.name_nav,
         .namespace = extra.data.namespace,
         .layout = .@"packed",
@@ -3888,7 +4146,7 @@ pub fn loadEnumType(ip: *const InternPool, index: Index) LoadedEnumType {
         .is_reified = extra.data.bits.captures_len == .reified,
         .owner_union = owner_union,
         .name = extra.data.name,
-        .fqn = extra.data.fqn,
+        .fqn = .{ .word = @backingInt(extra.data.fqn), .name = extra.data.name },
         .name_nav = extra.data.name_nav,
         .namespace = extra.data.namespace,
         .int_tag_type = extra.data.int_tag_type,
@@ -3915,7 +4173,7 @@ pub fn loadOpaqueType(ip: *const InternPool, index: Index) LoadedOpaqueType {
             .len = extra.data.captures_len,
         },
         .name = extra.data.name,
-        .fqn = extra.data.fqn,
+        .fqn = .{ .word = @backingInt(extra.data.fqn), .name = extra.data.name },
         .name_nav = extra.data.name_nav,
         .namespace = extra.data.namespace,
     };
@@ -5496,8 +5754,6 @@ pub const Tag = enum(u8) {
     /// 0. name: NullTerminatedString for each names_len
     pub const ErrorSet = struct {
         names_len: u32,
-        /// Maps error names to declaration index.
-        names_map: MapIndex,
     };
 
     /// Trailing:
@@ -6316,6 +6572,8 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
         },
         .mutate = .{
             .arena = .{},
+            .owned = if (single_threaded) .empty else {},
+            .retired = if (single_threaded) .empty else {},
 
             .items = .empty,
             .extra = .empty,
@@ -6332,6 +6590,8 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
         },
     });
     for (ip.locals) |*local| try local.getMutableStrings(gpa, io).append(.{0});
+
+    if (build_options.peak_heap) census.note(ip, gpa);
 
     ip.tid_width = @intCast(std.math.log2_int_ceil(usize, used_threads));
     ip.tid_shift_30 = if (single_threaded) 0 else 30 - ip.tid_width;
@@ -6350,6 +6610,8 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
             .tracked_inst_map = .empty,
         },
     });
+
+    try ip.reserveFromHints(gpa, io);
 
     // Reserve string index 0 for an empty string.
     assert((try ip.getOrPutString(gpa, io, .main, "", .no_embedded_nulls)) == .empty);
@@ -6371,6 +6633,231 @@ pub fn init(ip: *InternPool, gpa: Allocator, io: Io, available_threads: usize) !
     }
 }
 
+/// `-Dpeak-heap` census of the per-thread arenas: how much is live list storage and how
+/// much is buffers retained by `setCapacity` after a growth (see the comment on
+/// `Local.mutate.arena`). Reported from the same `atexit` hook as PEAK_HEAP, because a
+/// one-shot compile leaves through `cleanExit` and never tears the pool down.
+pub const census = struct {
+    var pool: ?*const InternPool = null;
+    var pool_gpa: Allocator = undefined;
+    /// Bytes handed to `setCapacity`'s predecessors: dead list storage the arena keeps.
+    pub var retired_lists: usize = 0;
+    /// Same, for shard map tables superseded by a rehash.
+    pub var retired_maps: usize = 0;
+    /// Bytes of the two above that `reclaimRetired` has since released.
+    pub var reclaimed: usize = 0;
+    /// `Zcu.evictZir` / `File.getZir` traffic.
+    pub var zir_evictions: usize = 0;
+    pub var zir_reloads: usize = 0;
+    pub var zir_reload_bytes: usize = 0;
+
+    /// `ZIG_ZIR_POISON_EVICTED` set: `Zcu.evictZir` fills a file's ZIR with 0xaa and keeps the
+    /// memory instead of freeing it, so a `Zir` copy held across an eviction point changes the
+    /// output rather than reading whatever reuses the memory.
+    pub fn poisonEvictedZir() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached == null) S.cached = builtin.link_libc and std.c.getenv("ZIG_ZIR_POISON_EVICTED") != null;
+        return S.cached.?;
+    }
+
+    /// `ZIG_IP_POISON_RETIRED` set: `reclaimRetired` fills superseded storage with 0xaa and
+    /// keeps it instead of freeing it, so a slice held across a reclaim point changes the
+    /// output (compare against a normal run) rather than reading whatever reuses the memory.
+    fn poisonRetired() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached == null) S.cached = builtin.link_libc and std.c.getenv("ZIG_IP_POISON_RETIRED") != null;
+        return S.cached.?;
+    }
+
+    pub fn note(ip: *const InternPool, gpa: Allocator) void {
+        pool = ip;
+        pool_gpa = gpa;
+    }
+
+    pub fn report() void {
+        const ip = pool orelse return;
+        var arena: usize = 0;
+        var live: usize = 0;
+        for (ip.locals) |*local| {
+            arena += local.mutate.arena.promote(pool_gpa).queryCapacity();
+            inline for (@typeInfo(Local.Shared).@"struct".field_names) |name| {
+                live += @field(local.shared, name).bufferBytes();
+            }
+        }
+        // Every file whose ZIR is still loaded. Nothing drops ZIR today -- `unloadZir`
+        // has only teardown callers -- so this is the whole evictable set, and the
+        // question Stage C2 turns on: how much of peak is ZIR just sitting there.
+        var zir_files: usize = 0;
+        var zir_bytes: usize = 0;
+        var src_bytes: usize = 0;
+        for (ip.locals) |*local| {
+            const len = local.mutate.files.len;
+            if (len == 0) continue;
+            for (local.shared.files.view().items(.file)[0..len]) |f| {
+                const zir = f.zir orelse continue;
+                zir_files += 1;
+                zir_bytes += zir.instructions.len * (1 + @sizeOf(Zir.Inst.Data)) +
+                    zir.extra.len * @sizeOf(u32) + zir.string_bytes.len;
+                if (f.source) |src| src_bytes += src.len;
+            }
+        }
+        std.debug.print("ZIR_LIVE files {d} bytes {d} src {d}\n", .{ zir_files, zir_bytes, src_bytes });
+        std.debug.print("ZIR_EVICT evictions {d} reloads {d} reload_bytes {d}\n", .{ zir_evictions, zir_reloads, zir_reload_bytes });
+
+        // Each entry of the `maps` list is a hash map that owns its storage outside the
+        // flat lists above: one per struct/union/enum/error-set type, sized to that type's
+        // field count. A one-name `error{X}` gets a whole map.
+        var field_maps: usize = 0;
+        var field_map_entries: usize = 0;
+        for (ip.locals) |*local| {
+            const len = local.mutate.maps.len;
+            if (len == 0) continue;
+            field_maps += len;
+            for (local.shared.maps.view().items(.@"0")[0..len]) |*m| {
+                field_map_entries += m.capacity();
+            }
+        }
+        var maps: usize = 0;
+        for (ip.shards) |*shard| {
+            maps += shard.shared.map.tableBytes();
+            maps += shard.shared.string_map.tableBytes();
+            maps += shard.shared.tracked_inst_map.tableBytes();
+        }
+        std.debug.print("IP_FIELDMAPS {d} entries {d}\n", .{ field_maps, field_map_entries });
+        std.debug.print("IP_ARENA {d} IP_LIVE {d} IP_RETIRED {d} IP_MAPS {d} IP_RMAPS {d} IP_SLACK {d} IP_RECLAIMED {d}\n", .{
+            arena,     live,           retired_lists, maps,       retired_maps,
+            arena -| live -| retired_lists -| maps -| retired_maps, reclaimed,
+        });
+    }
+};
+
+/// Frees the storage superseded since the last call (see `Local.mutate.retired`). Only sound
+/// where nothing can still hold a slice into the pool's lists or maps: the main analysis loop
+/// calls it between top-level units, when every frame that could have taken one has returned.
+/// A no-op unless single-threaded, where other threads could be reading the old storage.
+pub fn reclaimRetired(ip: *InternPool, gpa: Allocator) void {
+    if (!single_threaded) return;
+    for (ip.locals) |*local| {
+        const retired = &local.mutate.retired;
+        if (retired.items.len == 0) continue;
+        if (build_options.peak_heap and census.poisonRetired()) {
+            // Validation: keep the memory but make any stale read of it visible.
+            for (retired.items) |buf| @memset(buf.ptr[0..buf.len], 0xaa);
+            local.mutate.owned.appendSlice(gpa, retired.items) catch return;
+        } else {
+            for (retired.items) |buf| gpa.rawFree(buf.ptr[0..buf.len], buf.alignment, @returnAddress());
+        }
+        if (build_options.peak_heap) {
+            for (retired.items) |buf| census.reclaimed += buf.len;
+        }
+        retired.clearRetainingCapacity();
+    }
+}
+
+/// The sizes a pool reached, from an earlier compile of the same thing (`Zcu`, `ZIG_IP_HINTS`).
+/// Single-threaded, `init` then gives every large list and table that size up front: allocated
+/// once, early and side by side, instead of each growth taking a larger block while the outgrown
+/// one waits for `reclaimRetired`. Without an MMU (a device compiler) that ladder of growing
+/// blocks left free memory too scattered for the next one well before memory ran out.
+pub const SizeHints = struct {
+    items: u32 = 0,
+    extra: u32 = 0,
+    limbs: u32 = 0,
+    strings: u32 = 0,
+    string_bytes: u32 = 0,
+    tracked_insts: u32 = 0,
+    navs: u32 = 0,
+    map: u32 = 0,
+    string_map: u32 = 0,
+    tracked_inst_map: u32 = 0,
+
+    pub fn parse(text: []const u8) SizeHints {
+        var h: SizeHints = .{};
+        var lines = std.mem.tokenizeScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            var words = std.mem.tokenizeScalar(u8, line, ' ');
+            const name = words.next() orelse continue;
+            const value = std.fmt.parseInt(u32, words.next() orelse continue, 10) catch continue;
+            inline for (@typeInfo(SizeHints).@"struct".field_names) |field| {
+                if (std.mem.eql(u8, name, field)) @field(h, field) = value;
+            }
+        }
+        return h;
+    }
+
+    /// What this pool reached, to `parse` next time.
+    pub fn ofPool(ip: *const InternPool) SizeHints {
+        var h: SizeHints = .{};
+        for (ip.locals) |*local| {
+            h.items += local.mutate.items.len;
+            h.extra += local.mutate.extra.len;
+            h.limbs += local.mutate.limbs.len;
+            h.strings += local.mutate.strings.len;
+            h.string_bytes += local.mutate.string_bytes.len;
+            h.tracked_insts += local.mutate.tracked_insts.len;
+            h.navs += local.mutate.navs.len;
+        }
+        for (ip.shards) |*shard| {
+            h.map += shard.mutate.map.len;
+            h.string_map += shard.mutate.string_map.len;
+            h.tracked_inst_map += shard.mutate.tracked_inst_map.len;
+        }
+        return h;
+    }
+
+    pub fn format(h: SizeHints, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        inline for (@typeInfo(SizeHints).@"struct".field_names) |field| {
+            try w.print("{s} {d}\n", .{ field, @field(h, field) });
+        }
+    }
+};
+
+fn reserveFromHints(ip: *InternPool, gpa: Allocator, io: Io) Allocator.Error!void {
+    if (!single_threaded) return;
+    const h = ip.size_hints;
+    const local = &ip.locals[0];
+    // A little more than last time: the same compile, give or take a small edit (a larger one
+    // just grows the list once, as without hints).
+    const more = struct {
+        fn f(n: u32) u32 {
+            return if (n == 0) 0 else n + n / 256 + 16;
+        }
+    }.f;
+    inline for (.{
+        .{ "items", "getMutableItems" },
+        .{ "extra", "getMutableExtra" },
+        .{ "limbs", "getMutableLimbs" },
+        .{ "strings", "getMutableStrings" },
+        .{ "string_bytes", "getMutableStringBytes" },
+        .{ "tracked_insts", "getMutableTrackedInsts" },
+        .{ "navs", "getMutableNavs" },
+    }) |list| {
+        const mutable = @field(Local, list[1])(local, gpa, io);
+        const want = more(@field(h, list[0]));
+        if (want > mutable.list.header().capacity) try mutable.setCapacity(want);
+    }
+    const shard = &ip.shards[0];
+    inline for (.{ "map", "string_map", "tracked_inst_map" }) |name| {
+        const map = &@field(shard.shared, name);
+        const Map = @TypeOf(map.*);
+        assert(@field(shard.mutate, name).len == 0);
+        const want = more(@field(h, name));
+        if (want != 0) {
+            // Exactly the 3/4 load the growth in `getOrPutKey` allows.
+            const capacity = want / 3 * 4 + 8;
+            const buf = try local.poolAlloc(gpa, Map.alignment, Map.entries_offset + capacity * @sizeOf(Map.Entry));
+            const new_map: Map = .{ .entries = @ptrCast(buf[Map.entries_offset..].ptr) };
+            new_map.header().* = .{ .capacity = capacity };
+            @memset(new_map.entries[0..capacity], .empty);
+            map.* = new_map;
+        }
+    }
+}
+
 pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
     std.debug.assert(debug_state.intern_pool == null);
 
@@ -6389,6 +6876,7 @@ pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
 
     ip.dep_entries.deinit(gpa);
     ip.free_dep_entries.deinit(gpa);
+    ip.nav_linksections.deinit(gpa);
 
     gpa.free(ip.shards);
     for (ip.locals) |*local| {
@@ -6404,13 +6892,12 @@ pub fn deinit(ip: *InternPool, gpa: Allocator, io: Io) void {
             {
                 namespace.pub_decls.deinit(gpa);
                 namespace.priv_decls.deinit(gpa);
-                namespace.comptime_decls.deinit(gpa);
-                namespace.test_decls.deinit(gpa);
+                if (namespace.rare) |rare| rare.deinit(gpa);
             }
         };
         const maps = local.getMutableMaps(gpa, io);
         if (maps.mutate.len > 0) for (maps.view().items(.@"0")) |*map| map.deinit(gpa);
-        local.mutate.arena.promote(gpa).deinit();
+        local.poolFree(gpa);
     }
     gpa.free(ip.locals);
 
@@ -6494,14 +6981,14 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             } };
         },
 
-        .type_pointer => .{ .ptr_type = extraData(unwrapped_index.getExtra(ip), Tag.TypePointer, data) },
+        .type_pointer => .{ .ptr_type = typePointerExtraData(unwrapped_index.getExtra(ip), data) },
 
         .type_slice => {
             const many_ptr_index: Index = @fromBackingInt(@intCast(data));
             const many_ptr_unwrapped = many_ptr_index.unwrap(ip);
             const many_ptr_item = many_ptr_unwrapped.getItem(ip);
             assert(many_ptr_item.tag == .type_pointer);
-            var ptr_info = extraData(many_ptr_unwrapped.getExtra(ip), Tag.TypePointer, many_ptr_item.data);
+            var ptr_info = typePointerExtraData(many_ptr_unwrapped.getExtra(ip), many_ptr_item.data);
             ptr_info.flags.size = .slice;
             return .{ .ptr_type = ptr_info };
         },
@@ -6658,33 +7145,33 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             } };
         },
         .ptr_nav => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrNav, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrNav, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .nav = info.nav }, .byte_offset = info.byteOffset() } };
         },
         .ptr_comptime_alloc => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrComptimeAlloc, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrComptimeAlloc, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .comptime_alloc = info.index }, .byte_offset = info.byteOffset() } };
         },
         .ptr_uav => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrUav, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrUav, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .uav = .{
                 .val = info.val,
                 .orig_ty = info.ty,
             } }, .byte_offset = info.byteOffset() } };
         },
         .ptr_uav_aligned => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrUavAligned, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrUavAligned, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .uav = .{
                 .val = info.val,
                 .orig_ty = info.orig_ty,
             } }, .byte_offset = info.byteOffset() } };
         },
         .ptr_comptime_field => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrComptimeField, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrComptimeField, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .comptime_field = info.field_val }, .byte_offset = info.byteOffset() } };
         },
         .ptr_int => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrInt, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrInt, data);
             return .{ .ptr = .{
                 .ty = info.ty,
                 .base_addr = .int,
@@ -6692,16 +7179,16 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
             } };
         },
         .ptr_eu_payload => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrBase, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrBase, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .eu_payload = info.base }, .byte_offset = info.byteOffset() } };
         },
         .ptr_opt_payload => {
-            const info = extraData(unwrapped_index.getExtra(ip), PtrBase, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrBase, data);
             return .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .opt_payload = info.base }, .byte_offset = info.byteOffset() } };
         },
         .ptr_elem => {
             // Avoid `indexToKey` recursion by asserting the tag encoding.
-            const info = extraData(unwrapped_index.getExtra(ip), PtrBaseIndex, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrBaseIndex, data);
             const index_item = info.index.unwrap(ip).getItem(ip);
             return switch (index_item.tag) {
                 .int_usize => .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .arr_elem = .{
@@ -6714,7 +7201,7 @@ pub fn indexToKey(ip: *const InternPool, index: Index) Key {
         },
         .ptr_field => {
             // Avoid `indexToKey` recursion by asserting the tag encoding.
-            const info = extraData(unwrapped_index.getExtra(ip), PtrBaseIndex, data);
+            const info = ptrExtraData(unwrapped_index.getExtra(ip), PtrBaseIndex, data);
             const index_item = info.index.unwrap(ip).getItem(ip);
             return switch (index_item.tag) {
                 .int_usize => .{ .ptr = .{ .ty = info.ty, .base_addr = .{ .field = .{
@@ -6945,7 +7432,6 @@ fn extraErrorSet(tid: Zcu.PerThread.Id, extra: Local.Extra, extra_index: u32) Ke
             .start = @intCast(error_set.end),
             .len = error_set.data.names_len,
         },
-        .names_map = error_set.data.names_map.toOptional(),
     };
 }
 
@@ -7091,6 +7577,7 @@ const GetOrPutKey = union(enum) {
         io: Io,
         shard: *Shard,
         map_index: u32,
+        hash: u32,
     },
 
     fn put(gop: *GetOrPutKey) Index {
@@ -7112,7 +7599,7 @@ const GetOrPutKey = union(enum) {
         assert(index != .none);
         switch (gop.*) {
             .existing => unreachable,
-            .new => |*info| gop.new.shard.shared.map.entries[info.map_index].release(index),
+            .new => |*info| gop.new.shard.shared.map.entries[info.map_index].release(index, info.hash),
         }
     }
 
@@ -7121,7 +7608,7 @@ const GetOrPutKey = union(enum) {
         switch (gop.*) {
             .existing => unreachable,
             .new => |info| {
-                assert(info.shard.shared.map.entries[info.map_index].value == index);
+                assert(info.shard.shared.map.entries[info.map_index].get() == index);
                 info.shard.mutate.map.len += 1;
                 info.shard.mutate.map.mutex.unlock(info.io);
                 gop.* = .{ .existing = index };
@@ -7171,11 +7658,11 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     var map_mask = map.header().mask();
     var map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
         const index = entry.acquire();
         if (index == .none) break;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (index.unwrap(ip).getTag(ip) == .removed) continue;
         if (ip.indexToKey(index).eql(key, ip)) return .{ .existing = index };
     }
@@ -7187,11 +7674,11 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
         map_index = hash;
     }
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
-        const index = entry.value;
+        const index = entry.get();
         if (index == .none) break;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (ip.indexToKey(index).eql(key, ip)) {
             defer shard.mutate.map.mutex.unlock(io);
             return .{ .existing = index };
@@ -7199,57 +7686,60 @@ fn getOrPutKeyEnsuringAdditionalCapacity(
     }
     const map_header = map.header().*;
     const required = shard.mutate.map.len + additional_capacity;
-    if (required >= map_header.capacity * 3 / 5) {
-        const arena_state = &ip.getLocal(tid).mutate.arena;
-        var arena = arena_state.promote(gpa);
-        defer arena_state.* = arena.state;
+    if (required >= map_header.capacity / 4 * 3) {
+        const local = ip.getLocal(tid);
         var new_map_capacity = map_header.capacity;
         while (true) {
             new_map_capacity *= 2;
-            if (required < new_map_capacity * 3 / 5) break;
+            if (required < new_map_capacity / 4 * 3) break;
         }
-        const new_map_buf = try arena.allocator().alignedAlloc(
-            u8,
-            .fromByteUnits(Map.alignment),
+        if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+        const new_map_buf = try local.poolAlloc(
+            gpa,
+            Map.alignment,
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+        const old_map_header = map.header();
+        local.poolRetire(gpa, old_map_header);
         new_map.header().* = .{ .capacity = new_map_capacity };
-        @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
+        @memset(new_map.entries[0..new_map_capacity], .empty);
         const new_map_mask = new_map.header().mask();
         map_index = 0;
         while (map_index < map_header.capacity) : (map_index += 1) {
             const entry = &map.entries[map_index];
-            const index = entry.value;
+            const index = entry.get();
             if (index == .none) continue;
-            const item_hash = entry.hash;
+            const item_hash = entry.storedHash() orelse h: {
+                // A removed item only kept probe chains intact: the grown table needs none.
+                if (index.unwrap(ip).getTag(ip) == .removed) continue;
+                break :h @as(u32, @truncate(ip.indexToKey(index).hash64(ip) >> 32));
+            };
             var new_map_index = item_hash;
             while (true) : (new_map_index += 1) {
-                new_map_index &= new_map_mask;
+                new_map_index %= new_map_mask;
                 const new_entry = &new_map.entries[new_map_index];
-                if (new_entry.value != .none) continue;
-                new_entry.* = .{
-                    .value = index,
-                    .hash = item_hash,
-                };
+                if (new_entry.get() != .none) continue;
+                new_entry.set(index, item_hash);
                 break;
             }
         }
         map = new_map;
         map_index = hash;
         while (true) : (map_index += 1) {
-            map_index &= new_map_mask;
-            if (map.entries[map_index].value == .none) break;
+            map_index %= new_map_mask;
+            if (map.entries[map_index].get() == .none) break;
         }
         shard.shared.map.release(new_map);
+        local.poolFreeRetiredMap(gpa, old_map_header);
     }
-    map.entries[map_index].hash = hash;
     return .{ .new = .{
         .ip = ip,
         .tid = tid,
         .io = io,
         .shard = shard,
         .map_index = map_index,
+        .hash = hash,
     } };
 }
 
@@ -7297,7 +7787,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
 
             items.appendAssumeCapacity(.{
                 .tag = .type_pointer,
-                .data = try addExtra(extra, ptr_type_adjusted),
+                .data = try addTypePointerExtra(extra, ptr_type_adjusted),
             });
         },
         .array_type => |array_type| {
@@ -7361,18 +7851,13 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
             });
         },
         .error_set_type => |error_set_type| {
-            assert(error_set_type.names_map == .none);
             assert(std.sort.isSorted(NullTerminatedString, error_set_type.names.get(ip), {}, NullTerminatedString.indexLessThan));
-            const names = error_set_type.names.get(ip);
-            const names_map = try ip.addMap(gpa, io, tid, names.len);
-            ip.addStringsToMap(names_map, names);
             const names_len = error_set_type.names.len;
             try extra.ensureUnusedCapacity(@typeInfo(Tag.ErrorSet).@"struct".field_names.len + names_len);
             items.appendAssumeCapacity(.{
                 .tag = .type_error_set,
                 .data = addExtraAssumeCapacity(extra, Tag.ErrorSet{
                     .names_len = names_len,
-                    .names_map = names_map,
                 }),
             });
             extra.appendSliceAssumeCapacity(.{@ptrCast(error_set_type.names.get(ip))});
@@ -7436,11 +7921,11 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
             items.appendAssumeCapacity(switch (ptr.base_addr) {
                 .nav => |nav| .{
                     .tag = .ptr_nav,
-                    .data = try addExtra(extra, PtrNav.init(ptr.ty, nav, ptr.byte_offset)),
+                    .data = try addPtrExtra(extra, PtrNav.init(ptr.ty, nav, ptr.byte_offset)),
                 },
                 .comptime_alloc => |alloc_index| .{
                     .tag = .ptr_comptime_alloc,
-                    .data = try addExtra(extra, PtrComptimeAlloc.init(ptr.ty, alloc_index, ptr.byte_offset)),
+                    .data = try addPtrExtra(extra, PtrComptimeAlloc.init(ptr.ty, alloc_index, ptr.byte_offset)),
                 },
                 .uav => |uav| if (ptrsHaveSameAlignment(ip, ptr.ty, ptr_type, uav.orig_ty)) item: {
                     if (ptr.ty != uav.orig_ty) {
@@ -7452,17 +7937,17 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
                     }
                     break :item .{
                         .tag = .ptr_uav,
-                        .data = try addExtra(extra, PtrUav.init(ptr.ty, uav.val, ptr.byte_offset)),
+                        .data = try addPtrExtra(extra, PtrUav.init(ptr.ty, uav.val, ptr.byte_offset)),
                     };
                 } else .{
                     .tag = .ptr_uav_aligned,
-                    .data = try addExtra(extra, PtrUavAligned.init(ptr.ty, uav.val, uav.orig_ty, ptr.byte_offset)),
+                    .data = try addPtrExtra(extra, PtrUavAligned.init(ptr.ty, uav.val, uav.orig_ty, ptr.byte_offset)),
                 },
                 .comptime_field => |field_val| item: {
                     assert(field_val != .none);
                     break :item .{
                         .tag = .ptr_comptime_field,
-                        .data = try addExtra(extra, PtrComptimeField.init(ptr.ty, field_val, ptr.byte_offset)),
+                        .data = try addPtrExtra(extra, PtrComptimeField.init(ptr.ty, field_val, ptr.byte_offset)),
                     };
                 },
                 .eu_payload, .opt_payload => |base| item: {
@@ -7481,12 +7966,12 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
                             .opt_payload => .ptr_opt_payload,
                             else => unreachable,
                         },
-                        .data = try addExtra(extra, PtrBase.init(ptr.ty, base, ptr.byte_offset)),
+                        .data = try addPtrExtra(extra, PtrBase.init(ptr.ty, base, ptr.byte_offset)),
                     };
                 },
                 .int => .{
                     .tag = .ptr_int,
-                    .data = try addExtra(extra, PtrInt.init(ptr.ty, ptr.byte_offset)),
+                    .data = try addPtrExtra(extra, PtrInt.init(ptr.ty, ptr.byte_offset)),
                 },
                 .arr_elem, .field => |base_index| {
                     const base_ptr_type = ip.indexToKey(ip.typeOf(base_index.base)).ptr_type;
@@ -7531,7 +8016,7 @@ pub fn get(ip: *InternPool, gpa: Allocator, io: Io, tid: Zcu.PerThread.Id, key: 
                             .field => .ptr_field,
                             else => unreachable,
                         },
-                        .data = try addExtra(extra, PtrBaseIndex.init(ptr.ty, base_index.base, index_index, ptr.byte_offset)),
+                        .data = try addPtrExtra(extra, PtrBaseIndex.init(ptr.ty, base_index.base, index_index, ptr.byte_offset)),
                     });
                     return gop.put();
                 },
@@ -8964,7 +9449,8 @@ pub const WipContainerType = struct {
         wip: WipContainerType,
         ip: *InternPool,
         type_name: NullTerminatedString,
-        type_fqn: NullTerminatedString,
+        /// A `ContainerFqn` word.
+        type_fqn: u32,
         /// This should be the `Nav` we are named after if we use the `.parent` name strategy; `.none` otherwise.
         /// This is also `.none` if we use `.parent` because we are the root struct type for a file.
         name_nav: Nav.Index.Optional,
@@ -8972,7 +9458,7 @@ pub const WipContainerType = struct {
         const extra = ip.getLocalShared(wip.tid).extra.acquire();
         const extra_items = extra.view().items(.@"0");
         extra_items[wip.type_name_index] = @backingInt(type_name);
-        extra_items[wip.type_fqn_index] = @backingInt(type_fqn);
+        extra_items[wip.type_fqn_index] = type_fqn;
         extra_items[wip.name_nav_index] = @backingInt(name_nav);
     }
 
@@ -9198,7 +9684,8 @@ pub fn getExtern(
         .tid = tid,
         .index = items.mutate.len,
     }, ip);
-    const owner_nav = ip.createNav(gpa, io, tid, key.name, key.name, .{
+    // `Zcu.fmtNavFqn` prints the name of a `Nav` with no namespace.
+    const owner_nav = ip.createNav(gpa, io, tid, key.name, if (Zcu.lazy_nav_fqn) .empty else key.name, .{
         .type = key.ty,
         .@"align" = key.alignment,
         .@"linksection" = .none,
@@ -9498,9 +9985,6 @@ pub fn getErrorSetType(
     const extra = local.getMutableExtra(gpa, io);
     try extra.ensureUnusedCapacity(@typeInfo(Tag.ErrorSet).@"struct".field_names.len + names.len);
 
-    const names_map = try ip.addMap(gpa, io, tid, names.len);
-    errdefer local.mutate.maps.len -= 1;
-
     // The strategy here is to add the type unconditionally, then to ask if it
     // already exists, and if so, revert the lengths of the mutated arrays.
     // This is similar to what `getOrPutTrailingString` does.
@@ -9509,7 +9993,6 @@ pub fn getErrorSetType(
 
     const error_set_extra_index = addExtraAssumeCapacity(extra, Tag.ErrorSet{
         .names_len = @intCast(names.len),
-        .names_map = names_map,
     });
     extra.appendSliceAssumeCapacity(.{@ptrCast(names)});
     errdefer extra.mutate.len = prev_extra_len;
@@ -9528,8 +10011,6 @@ pub fn getErrorSetType(
         .data = error_set_extra_index,
     });
     errdefer items.mutate.len -= 1;
-
-    ip.addStringsToMap(names_map, names);
 
     return gop.put();
 }
@@ -9805,7 +10286,11 @@ fn finishFuncInstance(
         fn_owner_nav.name.fmt(ip), anon_name_counter.*,
     }, .no_embedded_nulls);
     anon_name_counter.* += 1;
-    const nav_fqn = try ip.namespacePtr(fn_namespace).internFullyQualifiedName(ip, gpa, io, tid, nav_name);
+    // `Zcu.fmtNavFqn` finds the namespace through the generic owner.
+    const nav_fqn: NullTerminatedString = if (Zcu.lazy_nav_fqn)
+        .empty
+    else
+        try ip.namespacePtr(fn_namespace).internFullyQualifiedName(ip, gpa, io, tid, nav_name);
     const nav_index = try ip.createNav(gpa, io, tid, nav_name, nav_fqn, .{
         .type = ip.typeOf(func_index),
         .@"align" = fn_owner_nav.resolved.?.@"align",
@@ -9831,11 +10316,11 @@ pub fn getIfExists(ip: *const InternPool, key: Key) ?Index {
     const map_mask = map.header().mask();
     var map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
         const index = entry.acquire();
         if (index == .none) return null;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (ip.indexToKey(index).eql(key, ip)) return index;
     }
 }
@@ -9908,6 +10393,60 @@ fn addInt(
         .limbs_len = limbs_len,
     });
     limbs_list.appendSliceAssumeCapacity(.{limbs});
+}
+
+/// Set in the `data` of a `ptr_*` item whose byte offset is zero: its payload is stored
+/// without the two trailing `byte_offset` words. Extra indexes never reach this bit.
+const ptr_no_offset_bit: u32 = 1 << 31;
+
+fn addPtrExtra(extra: Local.Extra.Mutable, item: anytype) Allocator.Error!u32 {
+    const index = try addExtra(extra, item);
+    if (item.byte_offset_a != 0 or item.byte_offset_b != 0) return index;
+    extra.mutate.len -= 2;
+    return index | ptr_no_offset_bit;
+}
+
+fn ptrExtraData(extra: Local.Extra, comptime T: type, data: u32) T {
+    if (data & ptr_no_offset_bit == 0) return extraData(extra, T, data);
+    const index = data & ~ptr_no_offset_bit;
+    const extra_items = extra.view().items(.@"0");
+    var result: T = undefined;
+    const field_names = @typeInfo(T).@"struct".field_names;
+    const field_types = @typeInfo(T).@"struct".field_types;
+    comptime assert(std.mem.eql(u8, field_names[field_names.len - 2], "byte_offset_a"));
+    comptime assert(std.mem.eql(u8, field_names[field_names.len - 1], "byte_offset_b"));
+    inline for (field_names[0 .. field_names.len - 2], field_types[0 .. field_names.len - 2], index..) |field_name, field_type, extra_index| {
+        @field(result, field_name) = switch (field_type) {
+            u32 => extra_items[extra_index],
+            else => @fromBackingInt(@intCast(extra_items[extra_index])),
+        };
+    }
+    result.byte_offset_a = 0;
+    result.byte_offset_b = 0;
+    return result;
+}
+
+/// Set in the `data` of a `type_pointer` item with no sentinel and no packed offset: its
+/// payload is only `child` and `flags`. Extra indexes never reach this bit.
+const short_payload_bit: u32 = 1 << 31;
+
+fn addTypePointerExtra(extra: Local.Extra.Mutable, ptr_type: Tag.TypePointer) Allocator.Error!u32 {
+    if (ptr_type.sentinel != .none or @as(u32, @bitCast(ptr_type.packed_offset)) != 0)
+        return addExtra(extra, ptr_type);
+    try extra.ensureUnusedCapacity(2);
+    const index: u32 = extra.mutate.len;
+    extra.appendAssumeCapacity(.{@backingInt(ptr_type.child)});
+    extra.appendAssumeCapacity(.{@as(u32, @bitCast(ptr_type.flags))});
+    return index | short_payload_bit;
+}
+
+fn typePointerExtraData(extra: Local.Extra, data: u32) Tag.TypePointer {
+    if (data & short_payload_bit == 0) return extraData(extra, Tag.TypePointer, data);
+    const words = extra.view().items(.@"0")[data & ~short_payload_bit ..][0..2];
+    return .{
+        .child = @fromBackingInt(@intCast(words[0])),
+        .flags = @bitCast(words[1]),
+    };
 }
 
 fn addExtra(extra: Local.Extra.Mutable, item: anytype) Allocator.Error!u32 {
@@ -11147,10 +11686,14 @@ pub fn getNav(ip: *const InternPool, index: Nav.Index) Nav {
         // The last few fields are populated by `resolveNav` so must be loaded atomically.
         .type = @atomicLoad(InternPool.Index, &view.items(.type)[unwrapped.index], .monotonic),
         .value = @atomicLoad(InternPool.Index, &view.items(.value)[unwrapped.index], .monotonic),
-        .@"linksection" = @atomicLoad(OptionalNullTerminatedString, &view.items(.@"linksection")[unwrapped.index], .monotonic),
+        .@"linksection" = if (single_threaded) {} else @atomicLoad(OptionalNullTerminatedString, &view.items(.@"linksection")[unwrapped.index], .monotonic),
         .bits = @atomicLoad(Nav.Repr.Bits, &view.items(.bits)[unwrapped.index], .monotonic),
     };
-    return repr.unpack();
+    var nav = repr.unpack();
+    if (single_threaded and repr.bits.has_linksection) {
+        nav.resolved.?.@"linksection" = ip.nav_linksections.get(index).?.toOptional();
+    }
+    return nav;
 }
 
 pub fn namespacePtr(ip: *InternPool, namespace_index: NamespaceIndex) *Zcu.Namespace {
@@ -11203,6 +11746,9 @@ fn createNav(
         .tid = tid,
         .index = navs.mutate.len,
     };
+    if (single_threaded) if (resolved.@"linksection".unwrap()) |ls| {
+        try ip.nav_linksections.put(gpa, index_unwrapped.wrap(ip), ls);
+    };
     try navs.append(Nav.pack(.{
         .name = name,
         .fqn = fqn,
@@ -11251,11 +11797,13 @@ pub fn createDeclNav(
 /// If its status is already `resolved`, the old value is discarded.
 pub fn resolveNav(
     ip: *InternPool,
+    gpa: Allocator,
     io: Io,
     nav: Nav.Index,
     resolved: @typeInfo(@FieldType(Nav, "resolved")).optional.child,
-) void {
+) Allocator.Error!void {
     const unwrapped = nav.unwrap(ip);
+    if (single_threaded) if (resolved.@"linksection".unwrap()) |ls| try ip.nav_linksections.put(gpa, nav, ls);
 
     const local = ip.getLocal(unwrapped.tid);
     local.mutate.extra.mutex.lockUncancelable(io);
@@ -11267,15 +11815,14 @@ pub fn resolveNav(
     const nav_analysis_zir_index = navs.items(.analysis_zir_index);
     const nav_types = navs.items(.type);
     const nav_values = navs.items(.value);
-    const nav_linksections = navs.items(.@"linksection");
     const nav_bits = navs.items(.bits);
 
     assert(nav_analysis_namespace[unwrapped.index] != .none);
     assert(nav_analysis_zir_index[unwrapped.index] != .none);
 
-    @atomicStore(
+    if (!single_threaded) @atomicStore(
         OptionalNullTerminatedString,
-        &nav_linksections[unwrapped.index],
+        &navs.items(.@"linksection")[unwrapped.index],
         resolved.@"linksection",
         .monotonic,
     );
@@ -11289,6 +11836,7 @@ pub fn resolveNav(
         .@"threadlocal" = resolved.@"threadlocal",
         .is_extern_decl = resolved.is_extern_decl,
         .want_analysis = true, // asserted above that this is already `true`
+        .has_linksection = single_threaded and resolved.@"linksection" != .none,
     }, .monotonic);
 
     @atomicStore(
@@ -11327,11 +11875,13 @@ pub fn createNamespace(
     const last_bucket_len = local.mutate.namespaces.last_bucket_len & Local.namespaces_bucket_mask;
     if (last_bucket_len == 0) {
         try namespaces.ensureUnusedCapacity(1);
-        var arena = namespaces.arena.promote(namespaces.gpa);
-        defer namespaces.arena.* = arena.state;
-        namespaces.appendAssumeCapacity(.{try arena.allocator().create(
-            [1 << Local.namespaces_bucket_width]Zcu.Namespace,
-        )});
+        const Bucket = [1 << Local.namespaces_bucket_width]Zcu.Namespace;
+        const bucket_buf = try namespaces.local.poolAlloc(
+            namespaces.gpa,
+            @alignOf(Bucket),
+            @sizeOf(Bucket),
+        );
+        namespaces.appendAssumeCapacity(.{@ptrCast(bucket_buf.ptr)});
     }
     const unwrapped_namespace_index: NamespaceIndex.Unwrapped = .{
         .tid = tid,
@@ -11490,10 +12040,10 @@ pub fn getOrPutTrailingString(
     var map_mask = map.header().mask();
     var map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
         const index = entry.acquire().unwrap() orelse break;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (!index.eqlSlice(key, ip)) continue;
         string_bytes.shrinkRetainingCapacity(start);
         return @fromBackingInt(@intCast(@backingInt(index)));
@@ -11506,67 +12056,61 @@ pub fn getOrPutTrailingString(
         map_index = hash;
     }
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
         const index = entry.acquire().unwrap() orelse break;
-        if (entry.hash != hash) continue;
+        if (!entry.hashMatches(hash)) continue;
         if (!index.eqlSlice(key, ip)) continue;
         string_bytes.shrinkRetainingCapacity(start);
         return @fromBackingInt(@intCast(@backingInt(index)));
     }
     defer shard.mutate.string_map.len += 1;
     const map_header = map.header().*;
-    if (shard.mutate.string_map.len < map_header.capacity * 3 / 5) {
+    if (shard.mutate.string_map.len < map_header.capacity / 4 * 3) {
         string_bytes.appendAssumeCapacity(.{0});
         strings.appendAssumeCapacity(.{string_bytes.mutate.len});
         const entry = &map.entries[map_index];
-        entry.hash = hash;
-        entry.release(@fromBackingInt(@intCast(@backingInt(value))));
+        entry.release(@fromBackingInt(@intCast(@backingInt(value))), hash);
         return value;
     }
-    const arena_state = &local.mutate.arena;
-    var arena = arena_state.promote(gpa);
-    defer arena_state.* = arena.state;
     const new_map_capacity = map_header.capacity * 2;
-    const new_map_buf = try arena.allocator().alignedAlloc(
-        u8,
-        .fromByteUnits(Map.alignment),
+    if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+    const new_map_buf = try local.poolAlloc(
+        gpa,
+        Map.alignment,
         Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
     );
     const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+    const old_map_header = map.header();
+    local.poolRetire(gpa, old_map_header);
     new_map.header().* = .{ .capacity = new_map_capacity };
-    @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
+    @memset(new_map.entries[0..new_map_capacity], .empty);
     const new_map_mask = new_map.header().mask();
     map_index = 0;
     while (map_index < map_header.capacity) : (map_index += 1) {
         const entry = &map.entries[map_index];
-        const index = entry.value.unwrap() orelse continue;
-        const item_hash = entry.hash;
+        const index = entry.get().unwrap() orelse continue;
+        const item_hash = entry.storedHash() orelse @as(u32, @truncate(Hash.hash(0, index.toSlice(ip)) >> 32));
         var new_map_index = item_hash;
         while (true) : (new_map_index += 1) {
-            new_map_index &= new_map_mask;
+            new_map_index %= new_map_mask;
             const new_entry = &new_map.entries[new_map_index];
-            if (new_entry.value != .none) continue;
-            new_entry.* = .{
-                .value = index.toOptional(),
-                .hash = item_hash,
-            };
+            if (new_entry.get() != .none) continue;
+            new_entry.set(index.toOptional(), item_hash);
             break;
         }
     }
     map = new_map;
     map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= new_map_mask;
-        if (map.entries[map_index].value == .none) break;
+        map_index %= new_map_mask;
+        if (map.entries[map_index].get() == .none) break;
     }
     string_bytes.appendAssumeCapacity(.{0});
     strings.appendAssumeCapacity(.{string_bytes.mutate.len});
-    map.entries[map_index] = .{
-        .value = @fromBackingInt(@intCast(@backingInt(value))),
-        .hash = hash,
-    };
+    map.entries[map_index].set(@fromBackingInt(@intCast(@backingInt(value))), hash);
     shard.shared.string_map.release(new_map);
+    local.poolFreeRetiredMap(gpa, old_map_header);
     return value;
 }
 
@@ -11578,10 +12122,10 @@ pub fn getString(ip: *InternPool, key: []const u8) OptionalNullTerminatedString 
     const map_mask = map.header().mask();
     var map_index = hash;
     while (true) : (map_index += 1) {
-        map_index &= map_mask;
+        map_index %= map_mask;
         const entry = &map.entries[map_index];
-        const index = entry.value.unwrap() orelse return .none;
-        if (entry.hash != hash) continue;
+        const index = entry.get().unwrap() orelse return .none;
+        if (!entry.hashMatches(hash)) continue;
         if (index.eqlSlice(key, ip)) return index.toOptional();
     }
 }
@@ -11786,7 +12330,7 @@ pub fn typeOf(ip: *const InternPool, index: Index) Index {
                 .bitpack,
                 => |t| {
                     const extra_list = unwrapped_index.getExtra(ip);
-                    return @fromBackingInt(@intCast(extra_list.view().items(.@"0")[item.data + std.meta.fieldIndex(t.Payload(), "ty").?]));
+                    return @fromBackingInt(@intCast(extra_list.view().items(.@"0")[(item.data & ~ptr_no_offset_bit) + std.meta.fieldIndex(t.Payload(), "ty").?]));
                 },
 
                 .int_u8 => .u8_type,
@@ -11866,7 +12410,7 @@ pub fn funcTypeReturnType(ip: *const InternPool, ty: Index) Index {
     const child_extra, const child_item = switch (ty_item.tag) {
         .type_pointer => child: {
             const child_index: Index = @fromBackingInt(@intCast(ty_extra.view().items(.@"0")[
-                ty_item.data + std.meta.fieldIndex(Tag.TypePointer, "child").?
+                (ty_item.data & ~short_payload_bit) + std.meta.fieldIndex(Tag.TypePointer, "child").?
             ]));
             const unwrapped_child = child_index.unwrap(ip);
             break :child .{ unwrapped_child.getExtra(ip), unwrapped_child.getItem(ip) };
@@ -11902,10 +12446,10 @@ pub fn getBackingAddrTag(ip: *const InternPool, val: Index) ?Key.Ptr.BaseAddr.Ta
             .ptr_elem,
             .ptr_field,
             => |tag| base = @fromBackingInt(@intCast(unwrapped_base.getExtra(ip).view().items(.@"0")[
-                base_item.data + std.meta.fieldIndex(tag.Payload(), "base").?
+                (base_item.data & ~ptr_no_offset_bit) + std.meta.fieldIndex(tag.Payload(), "base").?
             ])),
             inline .ptr_slice => |tag| base = @fromBackingInt(@intCast(unwrapped_base.getExtra(ip).view().items(.@"0")[
-                base_item.data + std.meta.fieldIndex(tag.Payload(), "ptr").?
+                (base_item.data & ~ptr_no_offset_bit) + std.meta.fieldIndex(tag.Payload(), "ptr").?
             ])),
             else => return null,
         }
@@ -12397,7 +12941,7 @@ fn ptrsHaveSameAlignment(ip: *InternPool, a_ty: Index, a_info: Key.PtrType, b_ty
 const GlobalErrorSet = struct {
     shared: struct {
         names: Names,
-        map: Shard.Map(GlobalErrorSet.Index),
+        map: Shard.Map(GlobalErrorSet.Index, false),
     } align(std.atomic.cache_line),
     mutate: struct {
         names: Local.ListMutate,
@@ -12432,7 +12976,7 @@ const GlobalErrorSet = struct {
         ges: *GlobalErrorSet,
         gpa: Allocator,
         io: Io,
-        arena_state: *std.heap.ArenaAllocator.State,
+        local: *Local,
         name: NullTerminatedString,
     ) Allocator.Error!GlobalErrorSet.Index {
         if (name == .empty) return .none;
@@ -12443,11 +12987,11 @@ const GlobalErrorSet = struct {
         const names = ges.shared.names.acquire();
         var map_index = hash;
         while (true) : (map_index += 1) {
-            map_index &= map_mask;
+            map_index %= map_mask;
             const entry = &map.entries[map_index];
             const index = entry.acquire();
             if (index == .none) break;
-            if (entry.hash != hash) continue;
+            if (!entry.hashMatches(hash)) continue;
             if (names.view().items(.@"0")[@backingInt(index) - 1] == name) return index;
         }
         ges.mutate.map.mutex.lockUncancelable(io);
@@ -12458,70 +13002,68 @@ const GlobalErrorSet = struct {
             map_index = hash;
         }
         while (true) : (map_index += 1) {
-            map_index &= map_mask;
+            map_index %= map_mask;
             const entry = &map.entries[map_index];
-            const index = entry.value;
+            const index = entry.get();
             if (index == .none) break;
-            if (entry.hash != hash) continue;
+            if (!entry.hashMatches(hash)) continue;
             if (names.view().items(.@"0")[@backingInt(index) - 1] == name) return index;
         }
         const mutable_names: Names.Mutable = .{
             .gpa = gpa,
             .io = io,
-            .arena = arena_state,
+            .local = local,
             .mutate = &ges.mutate.names,
             .list = &ges.shared.names,
         };
         try mutable_names.ensureUnusedCapacity(1);
         const map_header = map.header().*;
-        if (ges.mutate.names.len < map_header.capacity * 3 / 5) {
+        if (ges.mutate.names.len < map_header.capacity / 4 * 3) {
             mutable_names.appendAssumeCapacity(.{name});
             const index: GlobalErrorSet.Index = @fromBackingInt(@intCast(mutable_names.mutate.len));
             const entry = &map.entries[map_index];
-            entry.hash = hash;
-            entry.release(index);
+            entry.release(index, hash);
             return index;
         }
-        var arena = arena_state.promote(gpa);
-        defer arena_state.* = arena.state;
         const new_map_capacity = map_header.capacity * 2;
-        const new_map_buf = try arena.allocator().alignedAlloc(
-            u8,
-            .fromByteUnits(Map.alignment),
+        if (build_options.peak_heap) census.retired_maps += map.tableBytes();
+        const new_map_buf = try local.poolAlloc(
+            gpa,
+            Map.alignment,
             Map.entries_offset + new_map_capacity * @sizeOf(Map.Entry),
         );
         const new_map: Map = .{ .entries = @ptrCast(new_map_buf[Map.entries_offset..].ptr) };
+        const old_map_header = map.header();
+        local.poolRetire(gpa, old_map_header);
         new_map.header().* = .{ .capacity = new_map_capacity };
-        @memset(new_map.entries[0..new_map_capacity], .{ .value = .none, .hash = undefined });
+        @memset(new_map.entries[0..new_map_capacity], .empty);
         const new_map_mask = new_map.header().mask();
         map_index = 0;
         while (map_index < map_header.capacity) : (map_index += 1) {
             const entry = &map.entries[map_index];
-            const index = entry.value;
+            const index = entry.get();
             if (index == .none) continue;
-            const item_hash = entry.hash;
+            const item_hash = entry.storedHash().?;
             var new_map_index = item_hash;
             while (true) : (new_map_index += 1) {
-                new_map_index &= new_map_mask;
+                new_map_index %= new_map_mask;
                 const new_entry = &new_map.entries[new_map_index];
-                if (new_entry.value != .none) continue;
-                new_entry.* = .{
-                    .value = index,
-                    .hash = item_hash,
-                };
+                if (new_entry.get() != .none) continue;
+                new_entry.set(index, item_hash);
                 break;
             }
         }
         map = new_map;
         map_index = hash;
         while (true) : (map_index += 1) {
-            map_index &= new_map_mask;
-            if (map.entries[map_index].value == .none) break;
+            map_index %= new_map_mask;
+            if (map.entries[map_index].get() == .none) break;
         }
         mutable_names.appendAssumeCapacity(.{name});
         const index: GlobalErrorSet.Index = @fromBackingInt(@intCast(mutable_names.mutate.len));
-        map.entries[map_index] = .{ .value = index, .hash = hash };
+        map.entries[map_index].set(index, hash);
         ges.shared.map.release(new_map);
+        local.poolFreeRetiredMap(gpa, old_map_header);
         return index;
     }
 
@@ -12536,11 +13078,11 @@ const GlobalErrorSet = struct {
         const names_items = ges.shared.names.acquire().view().items(.@"0");
         var map_index = hash;
         while (true) : (map_index += 1) {
-            map_index &= map_mask;
+            map_index %= map_mask;
             const entry = &map.entries[map_index];
             const index = entry.acquire();
             if (index == .none) return null;
-            if (entry.hash != hash) continue;
+            if (!entry.hashMatches(hash)) continue;
             if (names_items[@backingInt(index) - 1] == name) return index;
         }
     }
@@ -12553,7 +13095,7 @@ pub fn getErrorValue(
     tid: Zcu.PerThread.Id,
     name: NullTerminatedString,
 ) Allocator.Error!Zcu.ErrorInt {
-    return @backingInt(try ip.global_error_set.getErrorValue(gpa, io, &ip.getLocal(tid).mutate.arena, name));
+    return @backingInt(try ip.global_error_set.getErrorValue(gpa, io, ip.getLocal(tid), name));
 }
 
 pub fn getErrorValueIfExists(ip: *const InternPool, name: NullTerminatedString) ?Zcu.ErrorInt {

@@ -47,6 +47,10 @@ fn_var_args: bool = false,
 /// Whether we are somewhere within a function. If `true`, any container decls may be
 /// generic and thus must be tunneled through closure.
 within_fn: bool = false,
+/// See `Options.strip_tests`.
+strip_tests: bool = false,
+/// See `Options.strip_debug`.
+strip_debug: bool = false,
 /// The return type of the current function. This may be a trivial `Ref`, or
 /// otherwise it refers to a `ret_type` instruction.
 fn_ret_ty: Zir.Inst.Ref = .none,
@@ -140,7 +144,27 @@ fn appendRefsAssumeCapacity(astgen: *AstGen, refs: []const Zir.Inst.Ref) void {
     astgen.extra.appendSliceAssumeCapacity(@ptrCast(refs));
 }
 
+pub const Options = struct {
+    /// Lower no `test` declarations: the ZIR is as if the source had none, except where a
+    /// function's locals are in scope (see `stripsTestsIn`). Only for a file whose tests can
+    /// never be analyzed -- one outside the main module, since only the main module's tests
+    /// run -- because AstGen errors inside a test body are then not reported, and the ZIR must
+    /// be cached apart from a full lowering of the same file.
+    strip_tests: bool = false,
+    /// Lower no `dbg_stmt` or `dbg_empty_stmt`: line information, which Sema discards for a
+    /// stripped module, the only kind of module a file lowered this way may belong to. The
+    /// ZIR must be cached apart from a full lowering of the same file, and Sema then does not
+    /// find the `dbg_stmt` it otherwise expects right before every call and switch.
+    /// (`dbg_var_ptr`/`dbg_var_val` stay: they also name the types of `const T = struct`
+    /// locals, the `.dbg_var` name strategy.)
+    strip_debug: bool = false,
+};
+
 pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
+    return generateOptions(gpa, tree, .{});
+}
+
+pub fn generateOptions(gpa: Allocator, tree: Ast, options: Options) Allocator.Error!Zir {
     assert(tree.mode == .zig);
 
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -154,6 +178,8 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
         .arena = arena.allocator(),
         .tree = &tree,
         .nodes_need_rl = &nodes_need_rl,
+        .strip_tests = options.strip_tests,
+        .strip_debug = options.strip_debug,
         .src_hasher = undefined, // `structDeclInner` for the root struct will set this
     };
     defer astgen.deinit(gpa);
@@ -161,13 +187,17 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
     // String table index 0 is reserved for `NullTerminatedString.empty`.
     try astgen.string_bytes.append(gpa, 0);
 
-    // We expect at least as many ZIR instructions and extra data items
-    // as AST nodes.
-    try astgen.instructions.ensureTotalCapacity(gpa, tree.nodes.len);
+    // Reserved exactly, near what the standard library lowers to per AST node (medians over
+    // its files: 1.06 instructions without `dbg_stmt`, ~1.25 with, and 3.0 extra words). The
+    // growth policy rounded the reservation up by as much as half again, and `extra`, reserved
+    // at one word per node, then grew three times over -- its last copy, old and new live
+    // together, was the peak of a whole compile on the device. Both are trimmed at the end.
+    const nodes = tree.nodes.len;
+    try astgen.instructions.setCapacity(gpa, nodes + if (options.strip_debug) nodes / 8 else nodes / 4);
 
     // First few indexes of extra are reserved and set at the end.
     const reserved_count = @typeInfo(Zir.ExtraIndex).@"enum".field_names.len;
-    try astgen.extra.ensureTotalCapacity(gpa, tree.nodes.len + reserved_count);
+    try astgen.extra.ensureTotalCapacityPrecise(gpa, 3 * nodes + reserved_count);
     astgen.extra.items.len += reserved_count;
 
     var top_scope: Scope.Top = .{};
@@ -245,12 +275,32 @@ pub fn generate(gpa: Allocator, tree: Ast) Allocator.Error!Zir {
 
     try astgen.extra.shrinkToLen(gpa);
     try astgen.string_bytes.shrinkToLen(gpa);
+    // `instructions` was reserved at one per AST node up front, and `toOwnedSlice` hands the
+    // whole capacity to the ZIR, which lives as long as the file does.
+    if (!fatal) astgen.instructions.shrinkAndFree(gpa, astgen.instructions.len);
 
     return .{
         .instructions = if (fatal) .empty else astgen.instructions.toOwnedSlice(),
         .string_bytes = astgen.string_bytes.toOwnedSliceAssert(),
         .extra = astgen.extra.toOwnedSliceAssert(),
     };
+}
+
+/// Between container members, where most of a file's growth happens, keeps half a step of
+/// room in `instructions` and `extra` by growing them one exact step -- an eighth of what
+/// `generateOptions` reserves for the file -- when there is less. Past the reservation the
+/// growth policy would add half the list again, a copy made next to the original and mostly
+/// never used: `Io.zig` needs 1.137 instructions and 3.27 extra words per node, just over the
+/// reservation, and the copies of both were the peak of a compile on the device.
+fn topUpZir(astgen: *AstGen) Allocator.Error!void {
+    const gpa = astgen.gpa;
+    const nodes = astgen.tree.nodes.len;
+    const inst_step = nodes / 8 + 16;
+    if (astgen.instructions.capacity - astgen.instructions.len < inst_step / 2)
+        try astgen.instructions.setCapacity(gpa, astgen.instructions.len + inst_step);
+    const extra_step = 3 * nodes / 8 + 16;
+    if (astgen.extra.capacity - astgen.extra.items.len < extra_step / 2)
+        try astgen.extra.ensureTotalCapacityPrecise(gpa, astgen.extra.items.len + extra_step);
 }
 
 fn deinit(astgen: *AstGen, gpa: Allocator) void {
@@ -5640,6 +5690,7 @@ fn containerMember(
 ) InnerError!ContainerMemberResult {
     const astgen = gz.astgen;
     const tree = astgen.tree;
+    try astgen.topUpZir();
     switch (tree.nodeTag(member_node)) {
         .container_field_init,
         .container_field_align,
@@ -5718,6 +5769,8 @@ fn containerMember(
             };
         },
         .test_decl => {
+            // `scanContainer` did not count it either.
+            if (astgen.stripsTestsIn(scope)) return .decl;
             const prev_decl_index = wip_decls.index;
             // We need to have *some* decl here so that the decl count matches what's expected.
             // Since it doesn't strictly matter *what* this is, let's save ourselves the trouble
@@ -6629,7 +6682,7 @@ fn whileExpr(
     if (!continue_scope.endsWithNoReturn()) {
         astgen.advanceSourceCursor(tree.tokenStart(tree.lastToken(then_node)));
         try emitDbgStmt(parent_gz, .{ astgen.source_line - parent_gz.decl_line, astgen.source_column });
-        _ = try parent_gz.add(.{
+        if (!astgen.strip_debug) _ = try parent_gz.add(.{
             .tag = .extended,
             .data = .{ .extended = .{
                 .opcode = .dbg_empty_stmt,
@@ -6961,7 +7014,7 @@ fn forExpr(
 
     astgen.advanceSourceCursor(tree.tokenStart(tree.lastToken(then_node)));
     try emitDbgStmt(parent_gz, .{ astgen.source_line - parent_gz.decl_line, astgen.source_column });
-    _ = try parent_gz.add(.{
+    if (!astgen.strip_debug) _ = try parent_gz.add(.{
         .tag = .extended,
         .data = .{ .extended = .{
             .opcode = .dbg_empty_stmt,
@@ -12977,6 +13030,22 @@ const ScanContainerResult = struct {
 };
 
 /// Detects name conflicts for decls and fields, and populates `namespace.decls` with all named declarations.
+/// Whether `strip_tests` leaves out the `test` declarations of the container whose namespace
+/// is `scope`. Not where a function's locals are in scope: a test may be the only use of one
+/// (`fn Tests(comptime T: type) type { return struct { test { ... T ... } }; }`), and leaving
+/// the test out would make that an "unused" error. Container-level declarations are never
+/// subject to those, so a test with only namespaces above it can go.
+fn stripsTestsIn(astgen: *AstGen, scope: *Scope) bool {
+    if (!astgen.strip_tests) return false;
+    s: switch (scope.unwrap()) {
+        .local_val, .local_ptr => return false,
+        .namespace => |ns| continue :s ns.parent.unwrap(),
+        .gen_zir => |gen_zir| continue :s gen_zir.parent.unwrap(),
+        .defer_normal, .defer_error => |defer_scope| continue :s defer_scope.parent.unwrap(),
+        .top => return true,
+    }
+}
+
 fn scanContainer(
     astgen: *AstGen,
     namespace: *Scope.Namespace,
@@ -13013,6 +13082,8 @@ fn scanContainer(
 
     var any_duplicates = false;
     var decl_count: u32 = 0;
+    // Members that are neither declarations nor fields: `test`s under `strip_tests`.
+    var stripped_count: u32 = 0;
     var any_field_aligns = false;
     var any_field_values = false;
     var any_comptime_fields = false;
@@ -13068,6 +13139,10 @@ fn scanContainer(
             },
 
             .test_decl => {
+                if (astgen.stripsTestsIn(&namespace.base)) {
+                    stripped_count += 1;
+                    continue;
+                }
                 decl_count += 1;
                 // We don't want shadowing detection here, and test names work a bit differently, so
                 // we must do the redeclaration detection ourselves.
@@ -13200,7 +13275,7 @@ fn scanContainer(
         if (any_invalid_declarations) return error.AnalysisFail;
         return .{
             .decls_len = decl_count,
-            .fields_len = @intCast(members.len - decl_count),
+            .fields_len = @intCast(members.len - decl_count - stripped_count),
             .any_field_aligns = any_field_aligns,
             .any_field_values = any_field_values,
             .any_comptime_fields = any_comptime_fields,
@@ -13333,7 +13408,7 @@ fn countBodyLenAfterFixupsExtraRefs(astgen: *AstGen, body: []const Zir.Inst.Inde
 }
 
 fn emitDbgStmt(gz: *GenZir, lc: LineColumn) !void {
-    if (gz.is_comptime) return;
+    if (gz.is_comptime or gz.astgen.strip_debug) return;
     if (gz.instructions.items.len > gz.instructions_top) {
         const astgen = gz.astgen;
         const last = gz.instructions.items[gz.instructions.items.len - 1];
@@ -13360,6 +13435,7 @@ fn emitDbgStmt(gz: *GenZir, lc: LineColumn) !void {
 /// instructions; fix up Sema so we don't need it!
 fn emitDbgStmtForceCurrentIndex(gz: *GenZir, lc: LineColumn) !void {
     const astgen = gz.astgen;
+    if (astgen.strip_debug) return;
     if (gz.instructions.items.len > gz.instructions_top and
         @backingInt(gz.instructions.items[gz.instructions.items.len - 1]) == astgen.instructions.len - 1)
     {

@@ -33,6 +33,7 @@ const Zcu = @import("Zcu.zig");
 const mingw = @import("libs/mingw.zig");
 const dev = @import("dev.zig");
 const Module = @import("Module.zig");
+const InternPool = @import("InternPool.zig");
 
 test {
     _ = @import("codegen.zig");
@@ -44,6 +45,11 @@ const thread_stack_size = 60 << 20;
 pub const std_options: std.Options = .{
     .logFn = log,
 
+    // The alternate signal stack is for the segfault handler, which std installs only with
+    // runtime safety. Without it the stack is 256 KiB of .bss that nothing runs on -- and on a
+    // microcontroller every process pays for its .bss in RAM.
+    .signal_stack_size = if (std.debug.default_enable_segfault_handler) (std.Options{}).signal_stack_size else null,
+
     .log_level = switch (builtin.mode) {
         .debug => .debug,
         .safe, .fast => .info,
@@ -51,6 +57,17 @@ pub const std_options: std.Options = .{
     },
 };
 pub const std_options_cwd = if (native_os == .wasi) wasi_cwd else null;
+/// `-Dcpu-family`: a compiler for a microcontroller carries only the CPU tables it targets
+/// (all 31 families are ~200 KB of RAM-resident data).
+pub const std_options_cpu_families: ?[]const std.Target.Cpu.Arch.Family = if (build_options.cpu_families.len == 0) null else families: {
+    var families: [build_options.cpu_families.len]std.Target.Cpu.Arch.Family = undefined;
+    for (&families, build_options.cpu_families) |*family, name| {
+        family.* = std.meta.stringToEnum(std.Target.Cpu.Arch.Family, name) orelse
+            @compileError("unknown architecture family: " ++ name);
+    }
+    const final = families;
+    break :families &final;
+};
 
 pub const panic = crash_report.panic;
 pub const debug = crash_report.debug;
@@ -164,8 +181,86 @@ var safe_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{
     .stack_trace_frames = build_options.mem_leak_frames,
 });
 
+/// Measurement only, enabled by `-Dpeak-heap`: wraps the root allocator to record
+/// peak live heap bytes and reports them at exit. Needs libc for `atexit`, so it
+/// stays inert in a freestanding build.
+const track_peak_heap = build_options.peak_heap and builtin.link_libc;
+
+const PeakTracker = struct {
+    child: Allocator,
+    cur: usize = 0,
+    peak: usize = 0,
+    count: usize = 0,
+    /// The same, counted in `malloc_usable_size` bytes: what the C allocator actually holds.
+    /// `c_allocator` treats every shrink as a successful in-place resize and never calls
+    /// `realloc`, so a buffer grown and then trimmed (`toOwnedSlice`, `shrinkAndFree`) keeps
+    /// its full size. `cur`/`peak` count the trimmed length and cannot see that.
+    usable_cur: usize = 0,
+    usable_peak: usize = 0,
+
+    const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn allocator(self: *PeakTracker) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    fn note(self: *PeakTracker, add: usize, sub: usize) void {
+        self.cur += add;
+        self.cur -= @min(sub, self.cur);
+        if (self.cur > self.peak) self.peak = self.cur;
+    }
+    fn usable(p: [*]u8) usize {
+        return if (@TypeOf(std.c.malloc_usable_size) != void) std.c.malloc_usable_size(p) else 0;
+    }
+    fn noteUsable(self: *PeakTracker, add: usize, sub: usize) void {
+        self.usable_cur += add;
+        self.usable_cur -= @min(sub, self.usable_cur);
+        if (self.usable_cur > self.usable_peak) self.usable_peak = self.usable_cur;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, a, ra) orelse return null;
+        self.count += 1;
+        self.note(len, 0);
+        self.noteUsable(usable(p), 0);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const old_usable = usable(memory.ptr);
+        if (!self.child.rawResize(memory, a, new_len, ra)) return false;
+        self.note(new_len, memory.len);
+        self.noteUsable(usable(memory.ptr), old_usable);
+        return true;
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        const old_usable = usable(memory.ptr);
+        const p = self.child.rawRemap(memory, a, new_len, ra) orelse return null;
+        self.note(new_len, memory.len);
+        self.noteUsable(usable(p), old_usable);
+        return p;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *PeakTracker = @ptrCast(@alignCast(ctx));
+        self.noteUsable(0, usable(memory.ptr));
+        self.child.rawFree(memory, a, ra);
+        self.note(0, memory.len);
+    }
+};
+
+var peak_tracker: if (track_peak_heap) PeakTracker else void = undefined;
+
+extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
+
+fn reportPeak() callconv(.c) void {
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "PEAK_HEAP {d} allocs {d} usable {d}\n", .{ peak_tracker.peak, peak_tracker.count, peak_tracker.usable_peak }) catch return;
+    _ = std.c.write(2, msg.ptr, msg.len);
+    InternPool.census.report();
+}
+
 pub fn main(init: std.process.Init.Minimal) anyerror!void {
-    const root_gpa = if (use_safe_allocator)
+    const unwrapped_gpa = if (use_safe_allocator)
         safe_allocator.allocator()
     else if (native_os == .wasi)
         std.heap.wasm_allocator
@@ -173,6 +268,11 @@ pub fn main(init: std.process.Init.Minimal) anyerror!void {
         std.heap.c_allocator
     else
         std.heap.smp_allocator;
+    const root_gpa = if (track_peak_heap) gpa: {
+        peak_tracker = .{ .child = unwrapped_gpa };
+        _ = atexit(reportPeak);
+        break :gpa peak_tracker.allocator();
+    } else unwrapped_gpa;
     defer if (use_safe_allocator) {
         _ = safe_allocator.deinit();
     };
@@ -431,6 +531,7 @@ fn mainArgs(
                 .self_exe_path = self_exe_path,
                 .environ_map = environ_map,
                 .cwd = try std.zig.getResolvedCwd(io, arena),
+                .zig_lib_search = build_options.zig_lib_search,
             });
             defer dirs.deinit(io);
             const host = std.zig.resolveTargetQueryOrFatal(io, .{});
@@ -465,6 +566,7 @@ fn mainArgs(
                 .self_exe_path = if (native_os != .wasi) self_exe_path,
                 .environ_map = environ_map,
                 .cwd = try std.zig.getResolvedCwd(io, arena),
+                .zig_lib_search = build_options.zig_lib_search,
             });
             defer dirs.deinit(io);
             const host = std.zig.resolveTargetQueryOrFatal(io, .{});
@@ -3332,6 +3434,7 @@ fn buildOutputType(
         .self_exe_path = self_exe_path,
         .environ_map = environ_map,
         .cwd = cwd_path,
+        .zig_lib_search = build_options.zig_lib_search,
     });
     defer dirs.deinit(io);
 
@@ -4561,7 +4664,8 @@ fn serveUpdateResults(s: *Server, comp: *Compilation) !void {
         for (tr.decl_sema_info.keys(), tr.decl_sema_info.values()) |tracked_inst, sema_info| {
             const resolved = tracked_inst.resolveFull(&comp.zcu.?.intern_pool) orelse continue;
             const file = comp.zcu.?.fileByIndex(resolved.file);
-            const zir = file.zir orelse continue;
+            if (file.zir == null and file.zir_cache == null) continue;
+            const zir = file.getZir(comp.zcu.?);
             const decl_name = zir.nullTerminatedString(zir.getDeclaration(resolved.inst).name);
 
             const gop = try files.getOrPut(gpa, resolved.file);
@@ -5085,6 +5189,7 @@ fn jitCmdInner(
         .self_exe_path = self_exe_path,
         .environ_map = environ_map,
         .cwd = cwd_path,
+        .zig_lib_search = build_options.zig_lib_search,
     });
     defer dirs.deinit(io);
 

@@ -404,6 +404,11 @@ pub const Block = struct {
     /// See `Sema.setTypeName`.
     type_name_ctx: InternPool.NullTerminatedString,
     type_fqn_ctx: InternPool.NullTerminatedString,
+    /// When `type_fqn_ctx` is a declaration's fully qualified name not interned yet
+    /// (`Zcu.lazy_nav_fqn`): that declaration, so `setTypeName` interns it only for a type it names.
+    type_fqn_nav: InternPool.Nav.Index.Optional = .none,
+    /// With neither of the above: the type whose fully qualified name it is.
+    type_fqn_type: InternPool.Index = .none,
 
     /// Create a `LazySrcLoc` based on an `Offset` from the code being analyzed in this block.
     /// Specifically, the given `Offset` is treated as relative to `block.src_baseline`.
@@ -533,6 +538,8 @@ pub const Block = struct {
             .src_baseline = parent.src_baseline,
             .type_name_ctx = parent.type_name_ctx,
             .type_fqn_ctx = parent.type_fqn_ctx,
+            .type_fqn_nav = parent.type_fqn_nav,
+            .type_fqn_type = parent.type_fqn_type,
         };
     }
 
@@ -1716,146 +1723,9 @@ fn analyzeBodyInner(
                 continue :inst .block_inline;
             } else try sema.zirBlock(block, inst),
 
-            .block_comptime => {
-                const pl_node = datas[@backingInt(inst)].pl_node;
-                const src = block.nodeOffset(pl_node.src_node);
-                const extra = sema.code.extraData(Zir.Inst.BlockComptime, pl_node.payload_index);
-                const block_body = sema.code.bodySlice(extra.end, extra.data.body_len);
+            .block_comptime => try @call(.never_inline, zirBlockComptime, .{ sema, block, inst }),
 
-                var child_block = block.makeSubBlock();
-                defer child_block.instructions.deinit(sema.gpa);
-
-                // We won't have any merges, but we must ensure this block is properly labeled for
-                // any `.restore_err_ret_index_*` instructions.
-                var label: Block.Label = .{
-                    .zir_block = inst,
-                    .merges = undefined,
-                };
-                child_block.label = &label;
-
-                child_block.comptime_reason = .{ .reason = .{
-                    .src = src,
-                    .r = .{ .simple = extra.data.reason },
-                } };
-
-                const result = try sema.resolveInlineBody(&child_block, block_body, inst);
-
-                // Only check for the result being comptime-known in the outermost `block_comptime`.
-                // That way, AstGen can safely elide redundant `block_comptime` without affecting semantics.
-                if (!block.isComptime() and !try sema.isComptimeKnown(result)) {
-                    return sema.failWithNeededComptime(&child_block, src, null);
-                }
-
-                break :inst result;
-            },
-
-            .block_inline => blk: {
-                // Directly analyze the block body without introducing a new block.
-                // However, in the case of a corresponding break_inline which reaches
-                // through a runtime conditional branch, we must retroactively emit
-                // a block, so we remember the block index here just in case.
-                const block_index = block.instructions.items.len;
-                const inst_data = datas[@backingInt(inst)].pl_node;
-                const extra = sema.code.extraData(Zir.Inst.Block, inst_data.payload_index);
-                const inline_body = sema.code.bodySlice(extra.end, extra.data.body_len);
-
-                const BreakResult = struct {
-                    block_inst: Zir.Inst.Index,
-                    operand: Zir.Inst.Ref,
-                };
-
-                const opt_break_data: ?BreakResult, const need_debug_scope = b: {
-                    // Create a temporary child block so that this inline block is properly
-                    // labeled for any .restore_err_ret_index instructions
-                    var child_block = block.makeSubBlock();
-                    var need_debug_scope = false;
-                    child_block.need_debug_scope = &need_debug_scope;
-
-                    // If this block contains a function prototype, we need to reset the
-                    // current list of parameters and restore it later.
-                    // Note: this probably needs to be resolved in a more general manner.
-                    const tag_index = @backingInt(inline_body[inline_body.len - 1]);
-                    child_block.inline_block = (if (tags[tag_index] == .repeat_inline)
-                        inline_body[0]
-                    else
-                        inst).toOptional();
-
-                    var label: Block.Label = .{
-                        .zir_block = inst,
-                        .merges = undefined,
-                    };
-                    child_block.label = &label;
-
-                    // Write these instructions directly into the parent block
-                    child_block.instructions = block.instructions;
-                    defer block.instructions = child_block.instructions;
-
-                    const break_result: ?BreakResult = if (sema.analyzeBodyInner(&child_block, inline_body)) r: {
-                        break :r null;
-                    } else |err| switch (err) {
-                        error.ComptimeBreak => brk_res: {
-                            const break_inst = sema.comptime_break_inst;
-                            const break_data = sema.code.instructions.items(.data)[@backingInt(break_inst)].@"break";
-                            const break_extra = sema.code.extraData(Zir.Inst.Break, break_data.payload_index).data;
-                            break :brk_res .{
-                                .block_inst = break_extra.block_inst,
-                                .operand = break_data.operand,
-                            };
-                        },
-                        else => |e| return e,
-                    };
-
-                    if (need_debug_scope) {
-                        _ = try sema.ensurePostHoc(block, inst);
-                    }
-
-                    break :b .{ break_result, need_debug_scope };
-                };
-
-                // A runtime conditional branch that needs a post-hoc block to be
-                // emitted communicates this by mapping the block index into the inst map.
-                if (map.get(inst)) |new_block_ref| ph: {
-                    // Comptime control flow populates the map, so we don't actually know
-                    // if this is a post-hoc runtime block until we check the
-                    // post_hoc_block map.
-                    const new_block_inst = new_block_ref.toIndex() orelse break :ph;
-                    const labeled_block = sema.post_hoc_blocks.get(new_block_inst) orelse
-                        break :ph;
-
-                    // In this case we need to move all the instructions starting at
-                    // block_index from the current block into this new one.
-
-                    if (opt_break_data) |break_data| {
-                        // This is a comptime break which we now change to a runtime break
-                        // since it crosses a runtime branch.
-                        // It may pass through our currently being analyzed block_inline or it
-                        // may point directly to it. In the latter case, this modifies the
-                        // block that we looked up in the post_hoc_blocks map above.
-                        try sema.addRuntimeBreak(block, break_data.block_inst, break_data.operand);
-                    }
-
-                    try labeled_block.block.instructions.appendSlice(gpa, block.instructions.items[block_index..]);
-                    block.instructions.items.len = block_index;
-
-                    const block_result = try sema.resolveAnalyzedBlock(block, block.nodeOffset(inst_data.src_node), &labeled_block.block, &labeled_block.label.merges, need_debug_scope);
-                    {
-                        // Destroy the ad-hoc block entry so that it does not interfere with
-                        // the next iteration of comptime control flow, if any.
-                        labeled_block.destroy(gpa);
-                        assert(sema.post_hoc_blocks.remove(new_block_inst));
-                    }
-
-                    break :blk block_result;
-                }
-
-                const break_data = opt_break_data orelse break;
-                if (inst == break_data.block_inst) {
-                    break :blk sema.resolveInst(break_data.operand);
-                } else {
-                    // `comptime_break_inst` preserved from `analyzeBodyInner` above.
-                    return error.ComptimeBreak;
-                }
-            },
+            .block_inline => (try @call(.never_inline, analyzeBlockInline, .{ sema, block, inst })) orelse break,
             .condbr => if (block.isComptime()) {
                 continue :inst .condbr_inline;
             } else {
@@ -1975,6 +1845,157 @@ fn analyzeBodyInner(
         map.putAssumeCapacity(inst, air_ref);
         i += 1;
     }
+}
+
+/// `analyzeBodyInner`'s `block_comptime`, out of line for the stack: its child block and
+/// label stay out of the frame that every nested body carries (the deepest stack of a
+/// compile is inline calls and blocks nested in each other, one `analyzeBodyInner` a level).
+fn zirBlockComptime(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.Inst.Ref {
+    const datas = sema.code.instructions.items(.data);
+        const pl_node = datas[@backingInt(inst)].pl_node;
+        const src = block.nodeOffset(pl_node.src_node);
+        const extra = sema.code.extraData(Zir.Inst.BlockComptime, pl_node.payload_index);
+        const block_body = sema.code.bodySlice(extra.end, extra.data.body_len);
+
+        var child_block = block.makeSubBlock();
+        defer child_block.instructions.deinit(sema.gpa);
+
+        // We won't have any merges, but we must ensure this block is properly labeled for
+        // any `.restore_err_ret_index_*` instructions.
+        var label: Block.Label = .{
+            .zir_block = inst,
+            .merges = undefined,
+        };
+        child_block.label = &label;
+
+        child_block.comptime_reason = .{ .reason = .{
+            .src = src,
+            .r = .{ .simple = extra.data.reason },
+        } };
+
+        const result = try sema.resolveInlineBody(&child_block, block_body, inst);
+
+        // Only check for the result being comptime-known in the outermost `block_comptime`.
+        // That way, AstGen can safely elide redundant `block_comptime` without affecting semantics.
+        if (!block.isComptime() and !try sema.isComptimeKnown(result)) {
+            return sema.failWithNeededComptime(&child_block, src, null);
+        }
+
+        return result;
+}
+
+/// `analyzeBodyInner`'s `block_inline`, out of line for the stack like `zirBlockComptime`.
+/// null: the body ended (the `break` out of `analyzeBodyInner`'s loop).
+fn analyzeBlockInline(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!?Air.Inst.Ref {
+    const gpa = sema.pt.zcu.comp.gpa;
+    const map = &sema.inst_map;
+    const tags = sema.code.instructions.items(.tag);
+    const datas = sema.code.instructions.items(.data);
+        // Directly analyze the block body without introducing a new block.
+        // However, in the case of a corresponding break_inline which reaches
+        // through a runtime conditional branch, we must retroactively emit
+        // a block, so we remember the block index here just in case.
+        const block_index = block.instructions.items.len;
+        const inst_data = datas[@backingInt(inst)].pl_node;
+        const extra = sema.code.extraData(Zir.Inst.Block, inst_data.payload_index);
+        const inline_body = sema.code.bodySlice(extra.end, extra.data.body_len);
+
+        const BreakResult = struct {
+            block_inst: Zir.Inst.Index,
+            operand: Zir.Inst.Ref,
+        };
+
+        const opt_break_data: ?BreakResult, const need_debug_scope = b: {
+            // Create a temporary child block so that this inline block is properly
+            // labeled for any .restore_err_ret_index instructions
+            var child_block = block.makeSubBlock();
+            var need_debug_scope = false;
+            child_block.need_debug_scope = &need_debug_scope;
+
+            // If this block contains a function prototype, we need to reset the
+            // current list of parameters and restore it later.
+            // Note: this probably needs to be resolved in a more general manner.
+            const tag_index = @backingInt(inline_body[inline_body.len - 1]);
+            child_block.inline_block = (if (tags[tag_index] == .repeat_inline)
+                inline_body[0]
+            else
+                inst).toOptional();
+
+            var label: Block.Label = .{
+                .zir_block = inst,
+                .merges = undefined,
+            };
+            child_block.label = &label;
+
+            // Write these instructions directly into the parent block
+            child_block.instructions = block.instructions;
+            defer block.instructions = child_block.instructions;
+
+            const break_result: ?BreakResult = if (sema.analyzeBodyInner(&child_block, inline_body)) r: {
+                break :r null;
+            } else |err| switch (err) {
+                error.ComptimeBreak => brk_res: {
+                    const break_inst = sema.comptime_break_inst;
+                    const break_data = sema.code.instructions.items(.data)[@backingInt(break_inst)].@"break";
+                    const break_extra = sema.code.extraData(Zir.Inst.Break, break_data.payload_index).data;
+                    break :brk_res .{
+                        .block_inst = break_extra.block_inst,
+                        .operand = break_data.operand,
+                    };
+                },
+                else => |e| return e,
+            };
+
+            if (need_debug_scope) {
+                _ = try sema.ensurePostHoc(block, inst);
+            }
+
+            break :b .{ break_result, need_debug_scope };
+        };
+
+        // A runtime conditional branch that needs a post-hoc block to be
+        // emitted communicates this by mapping the block index into the inst map.
+        if (map.get(inst)) |new_block_ref| ph: {
+            // Comptime control flow populates the map, so we don't actually know
+            // if this is a post-hoc runtime block until we check the
+            // post_hoc_block map.
+            const new_block_inst = new_block_ref.toIndex() orelse break :ph;
+            const labeled_block = sema.post_hoc_blocks.get(new_block_inst) orelse
+                break :ph;
+
+            // In this case we need to move all the instructions starting at
+            // block_index from the current block into this new one.
+
+            if (opt_break_data) |break_data| {
+                // This is a comptime break which we now change to a runtime break
+                // since it crosses a runtime branch.
+                // It may pass through our currently being analyzed block_inline or it
+                // may point directly to it. In the latter case, this modifies the
+                // block that we looked up in the post_hoc_blocks map above.
+                try sema.addRuntimeBreak(block, break_data.block_inst, break_data.operand);
+            }
+
+            try labeled_block.block.instructions.appendSlice(gpa, block.instructions.items[block_index..]);
+            block.instructions.items.len = block_index;
+
+            const block_result = try sema.resolveAnalyzedBlock(block, block.nodeOffset(inst_data.src_node), &labeled_block.block, &labeled_block.label.merges, need_debug_scope);
+            {
+                // Destroy the ad-hoc block entry so that it does not interfere with
+                // the next iteration of comptime control flow, if any.
+                labeled_block.destroy(gpa);
+                assert(sema.post_hoc_blocks.remove(new_block_inst));
+            }
+
+            return block_result;
+        }
+
+        const break_data = opt_break_data orelse return null;
+        if (inst == break_data.block_inst) {
+            return sema.resolveInst(break_data.operand);
+        } else {
+            // `comptime_break_inst` preserved from `analyzeBodyInner` above.
+            return error.ComptimeBreak;
+        }
 }
 
 fn resolveInstAllowNone(sema: *Sema, zir_ref: Zir.Inst.Ref) Air.Inst.Ref {
@@ -5292,6 +5313,8 @@ fn zirBlock(sema: *Sema, parent_block: *Block, inst: Zir.Inst.Index) CompileErro
         .src_baseline = parent_block.src_baseline,
         .type_name_ctx = parent_block.type_name_ctx,
         .type_fqn_ctx = parent_block.type_fqn_ctx,
+        .type_fqn_nav = parent_block.type_fqn_nav,
+        .type_fqn_type = parent_block.type_fqn_type,
     };
 
     defer child_block.instructions.deinit(gpa);
@@ -5845,6 +5868,9 @@ fn zirSwitchContinue(sema: *Sema, start_block: *Block, inst: Zir.Inst.Index) Com
 
 fn zirDbgStmt(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!void {
     if (block.isComptime() or block.ownerModule().strip) return;
+    // A call's or switch's preceding instruction, which is no `dbg_stmt` in ZIR lowered with
+    // `strip_debug` -- a file of a stripped module inlined into a function of one that is not.
+    if (sema.code.instructions.items(.tag)[@backingInt(inst)] != .dbg_stmt) return;
 
     const inst_data = sema.code.instructions.items(.data)[@backingInt(inst)].dbg_stmt;
 
@@ -6019,8 +6045,6 @@ fn lookupInNamespace(
 
     const namespace = zcu.namespacePtr(namespace_index);
 
-    const adapter: Zcu.Namespace.NameAdapter = .{ .zcu = zcu };
-
     const src_file = zcu.namespacePtr(block.namespace).file_scope;
 
     if (Type.fromInterned(namespace.owner_type).typeDeclInst(zcu)) |type_decl_inst| {
@@ -6030,14 +6054,14 @@ fn lookupInNamespace(
         } });
     }
 
-    if (namespace.pub_decls.getKeyAdapted(ident_name, adapter)) |nav_index| {
+    if (namespace.pub_decls.getPtr(ident_name)) |slot| {
         return .{
-            .nav = nav_index,
+            .nav = try pt.declSlotNav(namespace_index, ident_name, slot),
             .accessible = .public,
         };
-    } else if (namespace.priv_decls.getKeyAdapted(ident_name, adapter)) |nav_index| {
+    } else if (namespace.priv_decls.getPtr(ident_name)) |slot| {
         return .{
-            .nav = nav_index,
+            .nav = try pt.declSlotNav(namespace_index, ident_name, slot),
             .accessible = if (src_file == namespace.file_scope) .private_same_file else .private,
         };
     }
@@ -6738,17 +6762,25 @@ fn analyzeCall(
     // We might still learn that this call is inline *after* evaluating the generic return type.
     const early_known_inline = inline_requested or block.isComptime();
 
-    // These values are undefined if `func_val == null`.
-    const fn_nav: InternPool.Nav, const fn_zir: Zir, const fn_tracked_inst: InternPool.TrackedInst.Index, const fn_zir_inst: Zir.Inst.Index, const fn_zir_info: Zir.FnInfo = if (func_val) |f| b: {
+    // These values are undefined if `func_val == null`. `fn_zir` is used for the rest of the
+    // call, which may import and so evict ZIR: the callee's file stays pinned until it returns.
+    var fn_file: ?*Zcu.File = null;
+    // After the unpin below (defers run in reverse): a call can import, so the callers up the
+    // stack hold their ZIR pinned, and what the call loaded can go.
+    defer if (fn_file != null) zcu.evictZirAfterReloads() catch {};
+    defer if (fn_file) |file| file.unpinZir();
+    const fn_nav: InternPool.Nav, const fn_nav_index: InternPool.Nav.Index, const fn_zir: Zir, const fn_tracked_inst: InternPool.TrackedInst.Index, const fn_zir_inst: Zir.Inst.Index, const fn_zir_info: Zir.FnInfo = if (func_val) |f| b: {
         const info = ip.indexToKey(f.toIntern()).func;
         const nav = ip.getNav(info.owner_nav);
         const resolved_func_inst = info.zir_body_inst.resolveFull(ip) orelse {
             return sema.failTransitive(.{ .lost_tracking = info.zir_body_inst });
         };
         const file = zcu.fileByIndex(resolved_func_inst.file);
-        const zir_info = file.zir.?.getFnInfo(resolved_func_inst.inst);
-        break :b .{ nav, file.zir.?, info.zir_body_inst, resolved_func_inst.inst, zir_info };
-    } else .{ undefined, undefined, undefined, undefined, undefined };
+        const zir = file.pinZir(zcu);
+        fn_file = file;
+        const zir_info = zir.getFnInfo(resolved_func_inst.inst);
+        break :b .{ nav, info.owner_nav, zir, info.zir_body_inst, resolved_func_inst.inst, zir_info };
+    } else .{ undefined, undefined, undefined, undefined, undefined, undefined };
 
     // This is the `inst_map` used when evaluating generic parameters and return types.
     var generic_inst_map: InstMap = .{};
@@ -6781,6 +6813,7 @@ fn analyzeCall(
         .src_baseline = .{ .inst = fn_nav.analysis.?.zir_index, .node = .main },
         .type_name_ctx = fn_nav.name,
         .type_fqn_ctx = fn_nav.fqn,
+        .type_fqn_nav = fn_nav_index.toOptional(),
     } else undefined;
     defer if (any_generic_types) generic_block.instructions.deinit(gpa);
 
@@ -7321,6 +7354,7 @@ fn analyzeCall(
         .src_baseline = .{ .inst = fn_nav.analysis.?.zir_index, .node = .main },
         .type_name_ctx = fn_nav.name,
         .type_fqn_ctx = fn_nav.fqn,
+        .type_fqn_nav = fn_nav_index.toOptional(),
     };
 
     defer child_block.instructions.deinit(gpa);
@@ -12915,14 +12949,34 @@ fn zirImport(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileError!Air.
     const operand_src = block.tokenOffset(inst_data.src_tok);
     const operand = sema.code.nullTerminatedString(extra.path);
 
-    const result = pt.doImport(block.getFileScope(zcu), operand) catch |err| switch (err) {
+    const file_index: Zcu.File.Index = if (pt.doImport(block.getFileScope(zcu), operand)) |result| file: {
+        // A file an earlier import tried to load lazily and could not: it has no ZIR to populate
+        // a type from, so this import fails as the first one did (see `lazyImportFile`).
+        if (result.module_root == null and !zcu.comp.config.incremental and
+            zcu.fileByIndex(result.file).status != .success)
+        {
+            return sema.fail(block, operand_src, "unable to import '{s}'", .{operand});
+        }
+        if (result.module_root) |mod| if (!zcu.comp.config.incremental) {
+            pt.lazyModuleRoot(block.getFileScopeIndex(zcu), operand, result.file, mod) catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                error.ImportFailed => return sema.fail(block, operand_src, "unable to import '{s}'", .{operand}),
+            };
+        };
+        break :file result.file;
+    } else |err| switch (err) {
         error.ModuleNotFound => return sema.fail(block, operand_src, "no module named '{s}' available within module '{s}'", .{
             operand, block.getFileScope(zcu).mod.?.fully_qualified_name,
         }),
-        error.IllegalZigImport => unreachable, // caught before semantic analysis
+        // Caught before semantic analysis, except in files loaded lazily.
+        error.IllegalZigImport => return sema.fail(block, operand_src, "illegal import '{s}'", .{operand}),
         error.OutOfMemory => |e| return e,
+        error.NotLoaded => pt.lazyImportFile(block.getFileScopeIndex(zcu), operand) catch |lazy_err| switch (lazy_err) {
+            error.OutOfMemory, error.Canceled => |e| return e,
+            error.ImportFailed => return sema.fail(block, operand_src, "unable to import '{s}'", .{operand}),
+            error.FileOutsideModuleRoot => return sema.fail(block, operand_src, "import of file outside module path: '{s}'", .{operand}),
+        },
     };
-    const file_index = result.file;
     const file = zcu.fileByIndex(file_index);
     try sema.declareDependency(.{ .source_file = file_index });
     switch (file.getMode()) {
@@ -17300,8 +17354,7 @@ fn typeInfoNamespaceDecls(
     const gop = try seen_namespaces.getOrPut(namespace);
     if (gop.found_existing) return;
 
-    for (namespace.pub_decls.keys()) |nav| {
-        const name = ip.getNav(nav).name;
+    for (namespace.pub_decls.keys()) |name| {
         const name_val = name_val: {
             const name_len = name.length(ip);
             const array_ty = try pt.arrayType(.{
@@ -17361,6 +17414,8 @@ fn zirTypeofBuiltin(sema: *Sema, block: *Block, inst: Zir.Inst.Index) CompileErr
         .src_baseline = block.src_baseline,
         .type_name_ctx = block.type_name_ctx,
         .type_fqn_ctx = block.type_fqn_ctx,
+        .type_fqn_nav = block.type_fqn_nav,
+        .type_fqn_type = block.type_fqn_type,
     };
     defer child_block.instructions.deinit(sema.gpa);
 
@@ -17428,6 +17483,8 @@ fn zirTypeofPeer(
         .src_baseline = block.src_baseline,
         .type_name_ctx = block.type_name_ctx,
         .type_fqn_ctx = block.type_fqn_ctx,
+        .type_fqn_nav = block.type_fqn_nav,
+        .type_fqn_type = block.type_fqn_type,
     };
     defer child_block.instructions.deinit(sema.gpa);
     // Ignore the result, we only care about the instructions in `args`.
@@ -17993,6 +18050,8 @@ fn ensurePostHoc(sema: *Sema, block: *Block, dest_block: Zir.Inst.Index) !*Label
             .src_baseline = block.src_baseline,
             .type_name_ctx = block.type_name_ctx,
             .type_fqn_ctx = block.type_fqn_ctx,
+            .type_fqn_nav = block.type_fqn_nav,
+            .type_fqn_type = block.type_fqn_type,
         },
     };
     sema.post_hoc_blocks.putAssumeCapacityNoClobber(new_block_inst, labeled_block);
@@ -25992,6 +26051,8 @@ fn addSafetyCheck(
         .src_baseline = parent_block.src_baseline,
         .type_name_ctx = parent_block.type_name_ctx,
         .type_fqn_ctx = parent_block.type_fqn_ctx,
+        .type_fqn_nav = parent_block.type_fqn_nav,
+        .type_fqn_type = parent_block.type_fqn_type,
     };
 
     defer fail_block.instructions.deinit(gpa);
@@ -26087,6 +26148,8 @@ fn addSafetyCheckUnwrapError(
         .src_baseline = parent_block.src_baseline,
         .type_name_ctx = parent_block.type_name_ctx,
         .type_fqn_ctx = parent_block.type_fqn_ctx,
+        .type_fqn_nav = parent_block.type_fqn_nav,
+        .type_fqn_type = parent_block.type_fqn_type,
     };
 
     defer fail_block.instructions.deinit(gpa);
@@ -26211,6 +26274,8 @@ fn addSafetyCheckCall(
         .src_baseline = parent_block.src_baseline,
         .type_name_ctx = parent_block.type_name_ctx,
         .type_fqn_ctx = parent_block.type_fqn_ctx,
+        .type_fqn_nav = parent_block.type_fqn_nav,
+        .type_fqn_type = parent_block.type_fqn_type,
     };
 
     defer fail_block.instructions.deinit(gpa);
@@ -35336,6 +35401,67 @@ fn getExpectedBuiltinFnType(sema: *Sema, decl: Zcu.StdLangDecl) CompileError!Typ
     };
 }
 
+/// The text a new type's fully qualified name starts with (`Block.type_fqn_ctx`,
+/// `type_fqn_nav` or `type_fqn_type`).
+const TypeFqnCtx = struct {
+    zcu: *Zcu,
+    block: *const Block,
+
+    pub fn fmt(ctx: TypeFqnCtx, ip: *const InternPool) std.fmt.Alt(TypeFqnCtx, format) {
+        _ = ip;
+        return .{ .data = ctx };
+    }
+
+    pub fn format(ctx: TypeFqnCtx, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        const ip = &ctx.zcu.intern_pool;
+        if (ctx.block.type_fqn_ctx != .empty) return w.print("{f}", .{ctx.block.type_fqn_ctx.fmt(ip)});
+        if (ctx.block.type_fqn_nav.unwrap()) |nav| return w.print("{f}", .{ctx.zcu.fmtNavFqn(nav)});
+        if (ctx.block.type_fqn_type != .none) return w.print("{f}", .{ip.containerFqn(ctx.block.type_fqn_type).fmt(ip)});
+    }
+};
+
+/// The `ContainerFqn` word of a type named `name` declared in `block`, whose fully qualified
+/// name is `fmt`/`args`. Single-threaded and not incremental, it is derived from the name and
+/// the type of an enclosing namespace where the text allows, interned otherwise.
+fn typeFqnWord(
+    sema: *Sema,
+    block: *Block,
+    name: InternPool.NullTerminatedString,
+    comptime fmt: []const u8,
+    args: anytype,
+) Allocator.Error!u32 {
+    const pt = sema.pt;
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    const gpa = zcu.gpa;
+    const io = zcu.comp.io;
+    // A derived name refers to another type, which an incremental update can replace.
+    if (!Zcu.lazy_nav_fqn or zcu.comp.config.incremental) return InternPool.ContainerFqn.string(try ip.getOrPutStringFmt(gpa, io, pt.tid, fmt, args, .no_embedded_nulls));
+
+    var fqn_aw: std.Io.Writer.Allocating = .init(gpa);
+    defer fqn_aw.deinit();
+    fqn_aw.writer.print(fmt, args) catch return error.OutOfMemory;
+    const fqn = fqn_aw.written();
+    const name_slice = name.toSlice(ip);
+    if (std.mem.eql(u8, fqn, name_slice)) return InternPool.ContainerFqn.same_as_name;
+    if (fqn.len > name_slice.len and std.mem.endsWith(u8, fqn, name_slice) and
+        fqn[fqn.len - name_slice.len - 1] == '.')
+    {
+        const prefix = fqn[0 .. fqn.len - name_slice.len - 1];
+        var parent_aw: std.Io.Writer.Allocating = .init(gpa);
+        defer parent_aw.deinit();
+        var opt_ns = block.namespace.toOptional();
+        while (opt_ns.unwrap()) |ns_index| {
+            const ns = zcu.namespacePtr(ns_index);
+            parent_aw.clearRetainingCapacity();
+            parent_aw.writer.print("{f}", .{ip.containerFqn(ns.owner_type).fmt(ip)}) catch return error.OutOfMemory;
+            if (std.mem.eql(u8, parent_aw.written(), prefix)) return InternPool.ContainerFqn.derived(ns.owner_type);
+            opt_ns = ns.parent;
+        }
+    }
+    return InternPool.ContainerFqn.string(try ip.getOrPutString(gpa, io, pt.tid, fqn, .no_embedded_nulls));
+}
+
 pub fn setTypeName(
     sema: *Sema,
     block: *Block,
@@ -35350,6 +35476,7 @@ pub fn setTypeName(
     const gpa = comp.gpa;
     const io = comp.io;
     const ip = &zcu.intern_pool;
+    const type_fqn_ctx: TypeFqnCtx = .{ .zcu = zcu, .block = block };
 
     strat: switch (name_strategy) {
         .anon => {
@@ -35360,24 +35487,28 @@ pub fn setTypeName(
             // TODO: that would be possible, by detecting line number changes and renaming
             // types appropriately. However, `@typeName` becomes a problem then. If we remove
             // that builtin from the language, we can consider this.
-            wip.setName(ip, try ip.getOrPutStringFmt(
+            const name = try ip.getOrPutStringFmt(
                 gpa,
                 io,
                 pt.tid,
                 "{f}__{s}_{d}",
                 .{ block.type_name_ctx.fmt(ip), anon_prefix, zcu.anon_name_counter },
                 .no_embedded_nulls,
-            ), try ip.getOrPutStringFmt(
-                gpa,
-                io,
-                pt.tid,
+            );
+            wip.setName(ip, name, try sema.typeFqnWord(
+                block,
+                name,
                 "{f}__{s}_{d}",
-                .{ block.type_fqn_ctx.fmt(ip), anon_prefix, zcu.anon_name_counter },
-                .no_embedded_nulls,
+                .{ type_fqn_ctx.fmt(ip), anon_prefix, zcu.anon_name_counter },
             ), .none);
             zcu.anon_name_counter += 1;
         },
-        .parent => wip.setName(ip, block.type_name_ctx, block.type_fqn_ctx, sema.owner.unwrap().nav_val.toOptional()),
+        .parent => wip.setName(
+            ip,
+            block.type_name_ctx,
+            try sema.typeFqnWord(block, block.type_name_ctx, "{f}", .{type_fqn_ctx.fmt(ip)}),
+            sema.owner.unwrap().nav_val.toOptional(),
+        ),
         .func => {
             const fn_info = sema.code.getFnInfo(ip.funcZirBodyInst(sema.func_index).resolve(ip) orelse {
                 return sema.failTransitive(.{ .lost_tracking = ip.funcZirBodyInst(sema.func_index) });
@@ -35422,13 +35553,14 @@ pub fn setTypeName(
             };
 
             w.writeByte(')') catch return error.OutOfMemory;
-            wip.setName(ip, try ip.getOrPutStringFmt(gpa, io, pt.tid, "{f}{s}", .{
+            const name = try ip.getOrPutStringFmt(gpa, io, pt.tid, "{f}{s}", .{
                 block.type_name_ctx.fmt(ip),
                 aw.written(),
-            }, .no_embedded_nulls), try ip.getOrPutStringFmt(gpa, io, pt.tid, "{f}{s}", .{
-                block.type_fqn_ctx.fmt(ip),
+            }, .no_embedded_nulls);
+            wip.setName(ip, name, try sema.typeFqnWord(block, name, "{f}{s}", .{
+                type_fqn_ctx.fmt(ip),
                 aw.written(),
-            }, .no_embedded_nulls), .none);
+            }), .none);
         },
         .dbg_var => {
             // TODO: this logic is questionable. We ideally should be traversing the `Block` rather than relying on the order of AstGen instructions.
@@ -35443,12 +35575,13 @@ pub fn setTypeName(
             } else {
                 continue :strat .anon;
             };
-            wip.setName(ip, try ip.getOrPutStringFmt(gpa, io, pt.tid, "{f}.{s}", .{
+            const name = try ip.getOrPutStringFmt(gpa, io, pt.tid, "{f}.{s}", .{
                 // this "{f}." should be elided, but there's currently no way to get the parent function
                 block.type_name_ctx.fmt(ip), var_name,
-            }, .no_embedded_nulls), try ip.getOrPutStringFmt(gpa, io, pt.tid, "{f}.{s}", .{
-                block.type_fqn_ctx.fmt(ip), var_name,
-            }, .no_embedded_nulls), .none);
+            }, .no_embedded_nulls);
+            wip.setName(ip, name, try sema.typeFqnWord(block, name, "{f}.{s}", .{
+                type_fqn_ctx.fmt(ip), var_name,
+            }), .none);
         },
     }
 }

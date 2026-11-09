@@ -347,6 +347,10 @@ pub fn update(
 
             error.AnalysisFail => {},
         };
+        // Every frame that analyzed `unit` has returned, so nothing holds a slice into
+        // storage the pool superseded meanwhile, nor a `Zir` copied out of a `File`.
+        zcu.intern_pool.reclaimRetired(gpa);
+        try zcu.evictZir(.between_units);
     }
 }
 fn workerUpdateBuiltinFile(comp: *Compilation, file: *Zcu.File) void {
@@ -385,6 +389,20 @@ fn workerUpdateFile(
     switch (file.getMode()) {
         .zig => {}, // continue to logic below
         .zon => return, // ZON can't import anything so we're done
+    }
+
+    // Without incremental compilation, file imports are loaded on demand by `lazyImportFile`
+    // when semantic analysis first resolves them, so only what is actually used gets lowered.
+    if (!comp.config.incremental) {
+        // The module roots are all lowered before the first unit of analysis; under a ZIR budget
+        // each one's ZIR may go back to the cache (`File.getZir` reloads it) instead of all of
+        // them being held at once.  Nothing can hold a file's ZIR here.
+        comp.zcu.?.evictZir(.between_units) catch {
+            comp.mutex.lockUncancelable(io);
+            defer comp.mutex.unlock(io);
+            comp.setAllocFailure();
+        };
+        return;
     }
 
     // Discover all imports in the file. Imports of modules we ignore for now since we don't
@@ -486,12 +504,24 @@ pub fn updateFile(
         .global_cache, .zig_lib => false,
     };
 
+    // Only the main module's tests are ever analyzed, in any kind of compilation, so a file of
+    // any other module is lowered without them. For the standard library that is most of what
+    // it has: its tests are inline with the code they test.
+    const strip_tests = if (file.mod) |mod| mod != zcu.main_mod else false;
+    // A stripped module's Sema drops every debug-only instruction, so they need not exist.
+    // (Under incremental compilation, `strip` can change between updates without the file
+    // changing, which would leave it with ZIR lowered for the old setting.)
+    const strip_debug = if (file.mod) |mod| mod.strip and !zcu.comp.config.incremental else false;
+
     const hex_digest: Cache.HexDigest = d: {
         var h: Cache.HashHelper = .{};
         // As well as the file path, we also include the compiler version in case of backwards-incompatible ZIR changes.
         file.path.addToHasher(&h.hasher);
         h.addBytes(build_options.version);
         h.add(builtin.zig_backend);
+        // The same file lowers differently without its tests, so it is cached apart.
+        if (strip_tests) h.addBytes("strip_tests");
+        if (strip_debug) h.addBytes("strip_debug");
         break :d h.final();
     };
 
@@ -545,6 +575,7 @@ pub fn updateFile(
 
     // We're going to re-load everything, so unload source, AST, ZIR, ZOIR.
     file.unload(gpa);
+    file.zir_cache = null;
 
     // We ask for a lock in order to coordinate with other zig processes.
     // If another process is already working on this file, we will get the cached
@@ -608,6 +639,7 @@ pub fn updateFile(
         switch (result) {
             .success => if (!ignore_hit) {
                 log.debug("AstGen cached success: {f}", .{file.path.fmt(comp)});
+                if (file.getMode() == .zig) file.zir_cache = .{ .digest = hex_digest, .local = want_local_cache };
                 break false;
             },
             .invalid => {},
@@ -653,13 +685,15 @@ pub fn updateFile(
         timer = comp.startTimer();
         switch (file.getMode()) {
             .zig => {
-                file.zir = try AstGen.generate(gpa, file.tree.?);
-                Zcu.saveZirCache(gpa, &cache_file_writer, stat, &file.zir.?) catch |err| switch (err) {
+                file.zir = try AstGen.generateOptions(gpa, file.tree.?, .{ .strip_tests = strip_tests, .strip_debug = strip_debug });
+                if (Zcu.saveZirCache(gpa, &cache_file_writer, stat, &file.zir.?)) {
+                    file.zir_cache = .{ .digest = hex_digest, .local = want_local_cache };
+                } else |err| switch (err) {
                     error.OutOfMemory => |e| return e,
                     else => log.warn("unable to write cached ZIR code for {f} to {f}{s}: {t}", .{
                         file.path.fmt(comp), cache_directory, &hex_digest, err,
                     }),
-                };
+                }
             },
             .zon => {
                 file.zoir = try ZonGen.generate(gpa, file.tree.?, .{});
@@ -706,6 +740,13 @@ pub fn updateFile(
                 file.status = .astgen_failure;
             } else {
                 file.status = .success;
+            }
+            // Once ZIR exists, source and AST are only needed to render compile errors, and
+            // `File.getSource`/`File.getTree` reload them on demand. Keeping them resident for
+            // every file in the import graph roughly doubles peak memory on a cold ZIR cache.
+            if (!file.zir.?.hasCompileErrors()) {
+                file.unloadTree(gpa);
+                file.unloadSource(gpa);
             }
         },
         .zon => {
@@ -768,7 +809,7 @@ fn loadZirZoirCache(
     }
 
     switch (mode) {
-        .zig => file.zir = Zcu.loadZirCacheBody(gpa, header, cache_br) catch |err| switch (err) {
+        .zig => file.zir = Zcu.loadZirCacheBody(Zcu.zirAllocator(gpa), header, cache_br) catch |err| switch (err) {
             error.ReadFailed => return cache_fr.err.?,
             error.EndOfStream => return .truncated,
             else => |e| return e,
@@ -1043,7 +1084,8 @@ pub fn ensureFilePopulated(pt: Zcu.PerThread, file_index: Zcu.File.Index) (Alloc
 
     const file = zcu.fileByIndex(file_index);
     assert(file.getMode() == .zig);
-    const struct_decl = file.zir.?.getStructDecl(.main_struct_inst);
+    const struct_decl = file.pinZir(zcu).getStructDecl(.main_struct_inst);
+    defer file.unpinZir();
     const tracked_inst = try ip.trackZir(gpa, io, pt.tid, .{
         .file = file_index,
         .inst = .main_struct_inst,
@@ -1066,7 +1108,7 @@ pub fn ensureFilePopulated(pt: Zcu.PerThread, file_index: Zcu.File.Index) (Alloc
     wip.setName(
         ip,
         try ip.getOrPutString(gpa, io, pt.tid, std.fs.path.stem(file.sub_file_path), .no_embedded_nulls),
-        try file.internFullyQualifiedName(pt),
+        InternPool.ContainerFqn.string(try file.internFullyQualifiedName(pt)),
         .none,
     );
     const new_namespace_index: InternPool.NamespaceIndex = try pt.createNamespace(.{
@@ -1281,7 +1323,8 @@ fn analyzeComptimeUnit(pt: Zcu.PerThread, cu_id: InternPool.ComptimeUnit.Id) Zcu
         return error.AlreadyReported;
     };
     const file = zcu.fileByIndex(inst_resolved.file);
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, null);
     defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
@@ -1407,7 +1450,7 @@ pub fn ensureTypeLayoutUpToDate(
         info.deps.clearRetainingCapacity();
     }
 
-    const unit_tracking = zcu.trackUnitSema(ty.containerTypeName(ip).fqn.toSlice(ip), null);
+    const unit_tracking = zcu.trackUnitSema(ty.containerTypeName(ip).name.toSlice(ip), null);
     defer unit_tracking.end(zcu);
 
     try zcu.analysis_in_progress.put(gpa, anal_unit, reason);
@@ -1425,7 +1468,7 @@ pub fn ensureTypeLayoutUpToDate(
         .pt = pt,
         .gpa = gpa,
         .arena = analysis_arena.allocator(),
-        .code = file.zir.?,
+        .code = file.pinZir(zcu),
         .owner = anal_unit,
         .func_index = .none,
         .func_is_naked = false,
@@ -1433,6 +1476,7 @@ pub fn ensureTypeLayoutUpToDate(
         .fn_ret_ty_ies = null,
         .comptime_err_ret_trace = &comptime_err_ret_trace,
     };
+    defer file.unpinZir();
     defer sema.deinit();
 
     log.debug("ensureTypeLayoutUpToDate {f} (out of date, resolving)", .{zcu.fmtAnalUnit(anal_unit)});
@@ -1519,7 +1563,7 @@ pub fn ensureStructDefaultsUpToDate(
         info.deps.clearRetainingCapacity();
     }
 
-    const unit_tracking = zcu.trackUnitSema(ty.containerTypeName(ip).fqn.toSlice(ip), null);
+    const unit_tracking = zcu.trackUnitSema(ty.containerTypeName(ip).name.toSlice(ip), null);
     defer unit_tracking.end(zcu);
 
     try zcu.analysis_in_progress.put(gpa, anal_unit, reason);
@@ -1537,7 +1581,7 @@ pub fn ensureStructDefaultsUpToDate(
         .pt = pt,
         .gpa = gpa,
         .arena = analysis_arena.allocator(),
-        .code = file.zir.?,
+        .code = file.pinZir(zcu),
         .owner = anal_unit,
         .func_index = .none,
         .func_is_naked = false,
@@ -1545,6 +1589,7 @@ pub fn ensureStructDefaultsUpToDate(
         .fn_ret_ty_ies = null,
         .comptime_err_ret_trace = &comptime_err_ret_trace,
     };
+    defer file.unpinZir();
     defer sema.deinit();
 
     log.debug("ensureStructDefaultsUpToDate {f} (out of date, resolving)", .{zcu.fmtAnalUnit(anal_unit)});
@@ -1573,6 +1618,38 @@ pub fn ensureStructDefaultsUpToDate(
 /// Ensures that the resolved value of the given `Nav` is fully up-to-date, performing re-analysis
 /// if necessary. Returns `error.AnalysisFail` if an analysis error is encountered; the caller is
 /// free to ignore this, since the error is already registered.
+/// The `Nav` of the declaration `name` in `slot` of a namespace's `pub_decls`/`priv_decls`,
+/// created now if the scan left it pending (`Zcu.lazy_decl_navs`).
+pub fn declSlotNav(
+    pt: Zcu.PerThread,
+    namespace_index: InternPool.NamespaceIndex,
+    name: InternPool.NullTerminatedString,
+    slot: *Zcu.Namespace.DeclSlot,
+) Allocator.Error!InternPool.Nav.Index {
+    const inst = slot.pendingInst() orelse return slot.nav();
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    const gpa = zcu.gpa;
+    const io = zcu.comp.io;
+    const tracked_inst = try ip.trackZir(gpa, io, pt.tid, .{
+        .file = zcu.namespacePtr(namespace_index).file_scope,
+        .inst = inst,
+    });
+    const nav = try ip.createDeclNav(gpa, io, pt.tid, name, .empty, tracked_inst, namespace_index);
+    slot.* = .fromNav(nav);
+    return nav;
+}
+
+/// The fully qualified name of a `Nav` as a string, interned now if it is not kept
+/// (`Zcu.lazy_nav_fqn`).
+pub fn navFqn(pt: Zcu.PerThread, nav_id: InternPool.Nav.Index) Allocator.Error!InternPool.NullTerminatedString {
+    const zcu = pt.zcu;
+    const ip = &zcu.intern_pool;
+    const nav = ip.getNav(nav_id);
+    if (!Zcu.lazy_nav_fqn) return nav.fqn;
+    return ip.getOrPutStringFmt(zcu.gpa, zcu.comp.io, pt.tid, "{f}", .{zcu.fmtNavFqn(nav_id)}, .no_embedded_nulls);
+}
+
 pub fn ensureNavValUpToDate(
     pt: Zcu.PerThread,
     nav_id: InternPool.Nav.Index,
@@ -1657,6 +1734,49 @@ pub fn ensureNavValUpToDate(
     if (new_failed) return error.AnalysisFail;
 }
 
+/// For a declaration that is just `@import("path.zig")` -- `const Writer = @import("Io/Writer.zig");`,
+/// the shape of most of the standard library's namespaces -- lowers the imported file now, before
+/// the analysis of that declaration pins its file's ZIR. `zirImport` would lower it anyway, but
+/// under that pin: the declaring file kept loaded, for two instructions, through the lowering of
+/// another -- on the device, `Io.zig`'s 253 KB of ZIR held through `Io/Writer.zig`'s, the peak of
+/// the whole compile. Lowered here, the declaring file can be evicted like any other; `zirImport`
+/// then finds the file loaded. Only a new file is lowered: an import that fails, or one already
+/// made, is left to `zirImport` to handle and report exactly as before.
+fn lowerImportAlias(
+    pt: Zcu.PerThread,
+    decl: InternPool.TrackedInst,
+) (Allocator.Error || Io.Cancelable)!void {
+    const zcu = pt.zcu;
+    if (!builtin.single_threaded or zcu.zir_budget == 0 or zcu.comp.config.incremental) return;
+    const file = zcu.fileByIndex(decl.file);
+    const zir = file.getZir(zcu);
+    const value_body = zir.getDeclaration(decl.inst).value_body orelse return;
+    if (value_body.len != 2) return;
+    const tags = zir.instructions.items(.tag);
+    if (tags[@backingInt(value_body[0])] != .import or tags[@backingInt(value_body[1])] != .break_inline) return;
+    const inst_data = zir.instructions.items(.data)[@backingInt(value_body[0])].pl_tok;
+    const path = zir.nullTerminatedString(zir.extraData(Zir.Inst.Import, inst_data.payload_index).data.path);
+    if (!mem.endsWith(u8, path, ".zig")) return;
+    // Lowering may evict this file's ZIR, which `path` points into.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len > path_buf.len) return;
+    const import_string = path_buf[0..path.len];
+    @memcpy(import_string, path);
+    _ = pt.doImport(file, import_string) catch |err| switch (err) {
+        error.OutOfMemory => |e| return e,
+        error.NotLoaded => {
+            // Not even discovered: a path no earlier import attempted, so nothing it reports can
+            // differ from what `zirImport` would have.
+            _ = pt.lazyImportFile(decl.file, import_string) catch |lazy_err| switch (lazy_err) {
+                error.OutOfMemory, error.Canceled => |e| return e,
+                error.ImportFailed, error.FileOutsideModuleRoot => {},
+            };
+            return;
+        },
+        error.ModuleNotFound, error.IllegalZigImport => return,
+    };
+}
+
 fn analyzeNavVal(
     pt: Zcu.PerThread,
     nav_id: InternPool.Nav.Index,
@@ -1669,6 +1789,9 @@ fn analyzeNavVal(
     const io = comp.io;
 
     const anal_unit: AnalUnit = .wrap(.{ .nav_val = nav_id });
+    // A nested analysis can import, so whatever up the stack holds ZIR has pinned it (see
+    // `Zcu.File.pinZir`): keep the loaded ZIR within budget here too, not only between units.
+    try zcu.evictZirAfterReloads();
     const old_nav = ip.getNav(nav_id);
 
     log.debug("analyzeNavVal {f}", .{zcu.fmtAnalUnit(anal_unit)});
@@ -1686,8 +1809,10 @@ fn analyzeNavVal(
         );
         return error.AlreadyReported;
     };
+    try pt.lowerImportAlias(inst_resolved);
     const file = zcu.fileByIndex(inst_resolved.file);
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
     const zir_decl = zir.getDeclaration(inst_resolved.inst);
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, reason);
@@ -1733,6 +1858,7 @@ fn analyzeNavVal(
         },
         .type_name_ctx = old_nav.name,
         .type_fqn_ctx = old_nav.fqn,
+        .type_fqn_nav = nav_id.toOptional(),
     };
     defer block.instructions.deinit(gpa);
 
@@ -1909,7 +2035,7 @@ fn analyzeNavVal(
             try zcu.markPoDependeeUpToDate(.{ .nav_ty = nav_id });
         }
     }
-    ip.resolveNav(io, nav_id, .{
+    try ip.resolveNav(gpa, io, nav_id, .{
         .type = nav_ty.toIntern(),
         .@"align" = modifiers.@"align",
         .@"linksection" = modifiers.@"linksection",
@@ -2062,8 +2188,10 @@ fn analyzeNavType(
         );
         return error.AlreadyReported;
     };
+    try pt.lowerImportAlias(inst_resolved);
     const file = zcu.fileByIndex(inst_resolved.file);
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, reason);
     defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
@@ -2110,6 +2238,7 @@ fn analyzeNavType(
         },
         .type_name_ctx = old_nav.name,
         .type_fqn_ctx = old_nav.fqn,
+        .type_fqn_nav = nav_id.toOptional(),
     };
     defer block.instructions.deinit(gpa);
 
@@ -2179,7 +2308,7 @@ fn analyzeNavType(
 
     if (!changed) return .{ .type_changed = false };
 
-    ip.resolveNav(io, nav_id, .{
+    try ip.resolveNav(gpa, io, nav_id, .{
         .type = resolved_ty.toIntern(),
         .@"align" = modifiers.@"align",
         .@"linksection" = modifiers.@"linksection",
@@ -2293,6 +2422,10 @@ fn analyzeFuncBody(
 
     log.debug("analyzeFuncBody {f}", .{zcu.fmtAnalUnit(anal_unit)});
 
+    // A nested analysis can import, so whatever up the stack holds ZIR has pinned it (see
+    // `Zcu.File.pinZir`): keep the loaded ZIR within budget here too, not only between units.
+    try zcu.evictZirAfterReloads();
+
     const tracy_trace = trace(@src());
     defer tracy_trace.end();
     tracy_trace.addText(ip.getNav(func.owner_nav).fqn.toSlice(ip));
@@ -2318,6 +2451,9 @@ fn analyzeFuncBody(
         // concurrently, so we'll just keep ownership of the AIR for ourselves instead of
         // letting the codegen job destroy it.
         const disown_air = zcu.backendSupportsFeature(.separate_thread);
+
+        // Codegen reads no ZIR: what the finished analysis loaded can go first.
+        try zcu.evictZirAfterReloads();
 
         // Begin the codegen task. If the codegen/link queue is backed up, this might
         // block until the linker is able to process some tasks.
@@ -2369,7 +2505,7 @@ fn updateFileRootStructType(pt: Zcu.PerThread, file_index: Zcu.File.Index) Alloc
         // causes `Sema.zirStructType` (or whatever) to call `ensureNamespaceUpToDate`. However,
         // there is no "surrounding declaration" for the root struct type of a Zig source file, so
         // update this namespace now.
-        const decls = file.zir.?.getStructDecl(.main_struct_inst).decls;
+        const decls = file.getZir(zcu).getStructDecl(.main_struct_inst).decls;
         try pt.scanNamespace(loaded_struct.namespace, decls);
         zcu.namespacePtr(loaded_struct.namespace).generation = zcu.generation;
     }
@@ -2458,6 +2594,8 @@ pub fn doImport(
     OutOfMemory,
     ModuleNotFound,
     IllegalZigImport,
+    /// The file path has not been loaded yet; see `lazyImportFile`.
+    NotLoaded,
 }!struct {
     file: Zcu.File.Index,
     module_root: ?*Module,
@@ -2491,10 +2629,179 @@ pub fn doImport(
     if (try path.isIllegalZigImport(gpa, zcu.comp.dirs)) {
         return error.IllegalZigImport;
     }
-    return .{
-        .file = zcu.import_table.getKeyAdapted(path, Zcu.ImportTableAdapter{ .zcu = zcu }).?,
-        .module_root = null,
+    const file_index = zcu.import_table.getKeyAdapted(path, Zcu.ImportTableAdapter{ .zcu = zcu }) orelse {
+        assert(!zcu.comp.config.incremental); // otherwise AstGen discovered every import
+        return error.NotLoaded;
     };
+    return .{ .file = file_index, .module_root = null };
+}
+
+/// Loads a file on its first `@import` when compiling without incremental compilation, doing
+/// the work `workerUpdateFile` and `computeAliveFiles` do up front in incremental mode.
+/// `error.ImportFailed` means the reason is already recorded as a file error.
+pub fn lazyImportFile(
+    pt: Zcu.PerThread,
+    importer_index: Zcu.File.Index,
+    import_string: []const u8,
+) (Allocator.Error || Io.Cancelable || error{ ImportFailed, FileOutsideModuleRoot })!Zcu.File.Index {
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const gpa = comp.gpa;
+    const io = comp.io;
+    assert(!comp.config.incremental);
+    const importer = zcu.fileByIndex(importer_index);
+
+    const new = switch (try pt.discoverImport(importer.path, import_string)) {
+        .module => unreachable, // `doImport` only reports `NotLoaded` for file paths
+        .existing_file => |file_index| {
+            // An earlier attempt created the entry; it is only usable if that attempt succeeded.
+            if (zcu.fileByIndex(file_index).status != .success) return error.ImportFailed;
+            return file_index;
+        },
+        .new_file => |new| new,
+    };
+    const file = new.file;
+
+    const importer_mod = importer.mod.?;
+    switch (file.path.isNested(importer_mod.root)) {
+        .yes => |sub_path| {
+            file.mod = importer_mod;
+            file.sub_file_path = sub_path;
+        },
+        .different_roots, .no => {
+            file.status = .retryable_failure;
+            return error.FileOutsideModuleRoot;
+        },
+    }
+
+    // Error reporting only considers alive files, so register it before anything can fail.
+    const import_tok: Ast.TokenIndex = tok: {
+        const zir = importer.getZir(zcu);
+        const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
+        const extra = zir.extraData(Zir.Inst.Imports, imports_index);
+        var extra_index = extra.end;
+        for (0..extra.data.imports_len) |_| {
+            const item = zir.extraData(Zir.Inst.Imports.Item, extra_index);
+            extra_index = item.end;
+            if (mem.eql(u8, zir.nullTerminatedString(item.data.name), import_string)) break :tok item.data.token;
+        }
+        unreachable; // AstGen records every `@import` operand
+    };
+    try zcu.alive_files.put(gpa, new.index, .{ .import = .{
+        .importer = importer_index,
+        .tok = import_tok,
+        .module = null,
+    } });
+    try comp.appendFileSystemInput(file.path);
+
+    // Lowering a new file is when the loaded ZIR grows: make room first, keeping what the
+    // analysis up the stack has pinned.
+    try zcu.evictZir(.within_unit);
+
+    pt.updateFile(new.index, file) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        if (err == error.Canceled) return error.Canceled;
+        try pt.reportRetryableFileError(new.index, "unable to load '{s}': {s}", .{
+            std.fs.path.basename(file.path.sub_path), @errorName(err),
+        });
+        return error.ImportFailed;
+    };
+
+    // Every input must be in the cache manifest, or editing it would not invalidate the cache.
+    switch (comp.cache_use) {
+        .whole => |whole| if (whole.cache_manifest) |man| {
+            const result = res: {
+                try whole.cache_manifest_mutex.lock(io);
+                defer whole.cache_manifest_mutex.unlock(io);
+                break :res file.path.addToCacheManifestAsDiscovered(
+                    man,
+                    &comp.dirs,
+                    file.source,
+                    if (file.source != null) file.stat else null,
+                );
+            };
+            result catch |err| switch (err) {
+                error.OutOfMemory => |e| return e,
+                else => {
+                    try pt.reportRetryableFileError(new.index, "unable to update cache: {s}", .{@errorName(err)});
+                    return error.ImportFailed;
+                },
+            };
+        },
+        .none, .incremental => {},
+    }
+
+    if (file.status != .success) return error.ImportFailed;
+    try pt.lazyBuiltinImports(new.index);
+    return new.index;
+}
+
+/// `builtin` modules are otherwise created by `computeAliveFiles` before analysis; for a file
+/// it never reached, create the ones `file_index` imports.
+fn lazyBuiltinImports(pt: Zcu.PerThread, file_index: Zcu.File.Index) Allocator.Error!void {
+    const zcu = pt.zcu;
+    const comp = zcu.comp;
+    const gpa = comp.gpa;
+    const file = zcu.fileByIndex(file_index);
+    if (file.getMode() != .zig) return;
+    const zir = file.getZir(zcu);
+    const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
+    if (imports_index == 0) return;
+    const extra = zir.extraData(Zir.Inst.Imports, imports_index);
+    var extra_index = extra.end;
+    for (0..extra.data.imports_len) |_| {
+        const item = zir.extraData(Zir.Inst.Imports.Item, extra_index);
+        extra_index = item.end;
+        if (mem.eql(u8, zir.nullTerminatedString(item.data.name), "builtin")) {
+            const res = try pt.updateBuiltinModule(file.mod.?.getBuiltinOptions(comp.config));
+            const gop = try zcu.alive_files.getOrPut(gpa, res.file);
+            if (!gop.found_existing) gop.value_ptr.* = .{ .import = .{
+                .importer = file_index,
+                .tok = item.data.token,
+                .module = res.module_root,
+            } };
+        }
+    }
+}
+
+/// Without incremental compilation, `computeAliveFiles` does not follow imports into files
+/// loaded on demand, so the root of a module first imported from one of them has no module
+/// yet. Give it the module, as `computeAliveFiles` does for the roots it reaches, mark it alive,
+/// and create its `builtin` imports. `error.ImportFailed`: the root did not lower.
+pub fn lazyModuleRoot(
+    pt: Zcu.PerThread,
+    importer_index: Zcu.File.Index,
+    import_string: []const u8,
+    root_index: Zcu.File.Index,
+    mod: *Module,
+) (Allocator.Error || error{ImportFailed})!void {
+    const zcu = pt.zcu;
+    const gpa = zcu.gpa;
+    assert(!zcu.comp.config.incremental);
+    const root = zcu.fileByIndex(root_index);
+    if (root.mod != null) return;
+    if (root.status != .success) return error.ImportFailed;
+    root.mod = mod;
+    root.sub_file_path = mod.root_src_path;
+    const import_tok: Ast.TokenIndex = tok: {
+        const zir = zcu.fileByIndex(importer_index).getZir(zcu);
+        const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
+        const extra = zir.extraData(Zir.Inst.Imports, imports_index);
+        var extra_index = extra.end;
+        for (0..extra.data.imports_len) |_| {
+            const item = zir.extraData(Zir.Inst.Imports.Item, extra_index);
+            extra_index = item.end;
+            if (mem.eql(u8, zir.nullTerminatedString(item.data.name), import_string)) break :tok item.data.token;
+        }
+        unreachable; // AstGen records every `@import` operand
+    };
+    const gop = try zcu.alive_files.getOrPut(gpa, root_index);
+    if (!gop.found_existing) gop.value_ptr.* = .{ .import = .{
+        .importer = importer_index,
+        .tok = import_tok,
+        .module = mod,
+    } };
+    try pt.lazyBuiltinImports(root_index);
 }
 /// This is called once during `Compilation.create` and never again. "builtin" modules don't yet
 /// exist, so are not added to `module_roots` here. They must be added when they are created.
@@ -2656,7 +2963,7 @@ fn computeAliveFiles(pt: Zcu.PerThread) Allocator.Error!bool {
 
         if (file.status != .success) continue; // ZIR not valid if there was a file failure
 
-        const zir = &file.zir.?;
+        const zir = file.getZirPtr(zcu);
         const imports_index = zir.extra[@backingInt(Zir.ExtraIndex.imports)];
         if (imports_index == 0) continue; // this Zig file has no imports
         const extra = zir.extraData(Zir.Inst.Imports, imports_index);
@@ -2681,8 +2988,13 @@ fn computeAliveFiles(pt: Zcu.PerThread) Allocator.Error!bool {
                 continue;
             }
 
+            if (!comp.config.incremental and Zcu.File.modeFromPath(import_path) != null) {
+                continue; // loaded by `lazyImportFile` if semantic analysis reaches it
+            }
+
             const res = pt.doImport(file, import_path) catch |err| switch (err) {
                 error.OutOfMemory => |e| return e,
+                error.NotLoaded => unreachable, // file imports are skipped above when lazy
                 error.ModuleNotFound => {
                     // It'd be nice if this were a file-level error, but allowing this turns out to
                     // be quite important in practice, e.g. for optional dependencies whose import
@@ -2837,7 +3149,7 @@ fn updateBuiltinModule(pt: Zcu.PerThread, opts: Builtin) Allocator.Error!struct 
     try opts.populateFile(gpa, file);
 
     assert(file.status == .success);
-    const zir = &file.zir.?;
+    const zir = file.getZirPtr(zcu);
     assert(!zir.hasCompileErrors());
     {
         // Check that it has only one import, which is 'std'.
@@ -3062,11 +3374,11 @@ pub fn scanNamespace(
 
     const tracy_trace = trace(@src());
     defer tracy_trace.end();
-    tracy_trace.addText(Type.fromInterned(namespace.owner_type).containerTypeName(ip).fqn.toSlice(ip));
+    tracy_trace.addText(Type.fromInterned(namespace.owner_type).containerTypeName(ip).name.toSlice(ip));
     tracy_trace.addTextFmt("type_ip_index={d}", .{namespace.owner_type});
 
     const tracked_unit = zcu.trackUnitSema(
-        Type.fromInterned(namespace.owner_type).containerTypeName(ip).fqn.toSlice(ip),
+        Type.fromInterned(namespace.owner_type).containerTypeName(ip).name.toSlice(ip),
         null,
     );
     defer tracked_unit.end(zcu);
@@ -3079,23 +3391,23 @@ pub fn scanNamespace(
 
     try existing_by_inst.ensureTotalCapacity(gpa, @intCast(
         namespace.pub_decls.count() + namespace.priv_decls.count() +
-            namespace.comptime_decls.items.len +
-            namespace.test_decls.items.len,
+            namespace.comptimeDecls().len +
+            namespace.testDecls().len,
     ));
 
-    for (namespace.pub_decls.keys()) |nav| {
-        const zir_index = ip.getNav(nav).analysis.?.zir_index;
-        existing_by_inst.putAssumeCapacityNoClobber(zir_index, .wrap(.{ .nav_val = nav }));
+    for ([_][]const Zcu.Namespace.DeclSlot{ namespace.pub_decls.values(), namespace.priv_decls.values() }) |slots| {
+        for (slots) |slot| {
+            if (slot.pendingInst() != null) continue; // no `Nav` to keep
+            const nav = slot.nav();
+            const zir_index = ip.getNav(nav).analysis.?.zir_index;
+            existing_by_inst.putAssumeCapacityNoClobber(zir_index, .wrap(.{ .nav_val = nav }));
+        }
     }
-    for (namespace.priv_decls.keys()) |nav| {
-        const zir_index = ip.getNav(nav).analysis.?.zir_index;
-        existing_by_inst.putAssumeCapacityNoClobber(zir_index, .wrap(.{ .nav_val = nav }));
-    }
-    for (namespace.comptime_decls.items) |cu| {
+    for (namespace.comptimeDecls()) |cu| {
         const zir_index = ip.getComptimeUnit(cu).zir_index;
         existing_by_inst.putAssumeCapacityNoClobber(zir_index, .wrap(.{ .@"comptime" = cu }));
     }
-    for (namespace.test_decls.items) |nav| {
+    for (namespace.testDecls()) |nav| {
         const zir_index = ip.getNav(nav).analysis.?.zir_index;
         existing_by_inst.putAssumeCapacityNoClobber(zir_index, .wrap(.{ .nav_val = nav }));
         // This test will be re-added to `test_functions` later on if it's still alive. Remove it for now.
@@ -3107,8 +3419,32 @@ pub fn scanNamespace(
 
     namespace.pub_decls.clearRetainingCapacity();
     namespace.priv_decls.clearRetainingCapacity();
-    namespace.comptime_decls.clearRetainingCapacity();
-    namespace.test_decls.clearRetainingCapacity();
+    if (namespace.rare) |rare| {
+        rare.comptime_decls.clearRetainingCapacity();
+        rare.test_decls.clearRetainingCapacity();
+        rare.export_decls.clearRetainingCapacity();
+    }
+
+    // Exactly the room the named declarations need: a namespace's maps otherwise start at the
+    // growth policy's minimum, and most namespaces hold a few names (3.3x the entries overall).
+    {
+        const zir = namespace.fileScope(zcu).getZirPtr(zcu);
+        var n_pub: usize = 0;
+        var n_priv: usize = 0;
+        for (decls) |decl_inst| {
+            const decl = zir.getDeclaration(decl_inst);
+            switch (decl.kind) {
+                .@"const", .@"var" => if (decl.is_pub) {
+                    n_pub += 1;
+                } else {
+                    n_priv += 1;
+                },
+                else => {},
+            }
+        }
+        if (namespace.pub_decls.capacity() < n_pub) try namespace.pub_decls.entries.setCapacity(gpa, n_pub);
+        if (namespace.priv_decls.capacity() < n_priv) try namespace.priv_decls.entries.setCapacity(gpa, n_priv);
+    }
 
     var scan_decl_iter: ScanDeclIter = .{
         .pt = pt,
@@ -3165,7 +3501,7 @@ const ScanDeclIter = struct {
         const gpa = comp.gpa;
         const io = comp.io;
         const file = namespace.fileScope(zcu);
-        const zir = &file.zir.?;
+        const zir = file.getZirPtr(zcu);
         const ip = &zcu.intern_pool;
 
         const decl = zir.getDeclaration(decl_inst);
@@ -3201,6 +3537,15 @@ const ScanDeclIter = struct {
             },
         };
 
+        if (Zcu.lazy_decl_navs and !comp.config.incremental) switch (decl.kind) {
+            .@"const", .@"var" => if (decl.linkage != .@"export") {
+                const decls = if (decl.is_pub) &namespace.pub_decls else &namespace.priv_decls;
+                try decls.putNoClobber(gpa, maybe_name.unwrap().?, .pending(decl_inst));
+                return;
+            },
+            else => {},
+        };
+
         const tracked_inst = try ip.trackZir(gpa, io, pt.tid, .{
             .file = namespace.file_scope,
             .inst = decl_inst,
@@ -3212,21 +3557,25 @@ const ScanDeclIter = struct {
             // Only `comptime` declarations are unnamed.
             assert(decl.kind == .@"comptime");
             if (existing_unit) |unit| {
-                try namespace.comptime_decls.append(gpa, unit.unwrap().@"comptime");
+                try (try namespace.rareLists(gpa)).comptime_decls.append(gpa, unit.unwrap().@"comptime");
             } else {
                 const cu = try ip.createComptimeUnit(gpa, io, pt.tid, tracked_inst, namespace_index);
                 try zcu.queueComptimeUnitAnalysis(cu);
-                try namespace.comptime_decls.append(gpa, cu);
+                try (try namespace.rareLists(gpa)).comptime_decls.append(gpa, cu);
             }
             return;
         };
 
-        const fqn = try namespace.internFullyQualifiedName(ip, gpa, io, pt.tid, name);
+        const lazy_fqn = Zcu.lazy_nav_fqn;
+        const fqn: InternPool.NullTerminatedString = if (lazy_fqn)
+            .empty
+        else
+            try namespace.internFullyQualifiedName(ip, gpa, io, pt.tid, name);
 
         const nav = if (existing_unit) |unit| nav: {
             const nav = unit.unwrap().nav_val;
             assert(ip.getNav(nav).name == name);
-            assert(ip.getNav(nav).fqn == fqn);
+            assert(lazy_fqn or ip.getNav(nav).fqn == fqn);
             break :nav nav;
         } else nav: {
             const nav = try ip.createDeclNav(gpa, io, pt.tid, name, fqn, tracked_inst, namespace_index);
@@ -3238,7 +3587,7 @@ const ScanDeclIter = struct {
             .@"comptime" => unreachable,
             .unnamed_test, .@"test", .decltest => a: {
                 const is_named = decl.kind != .unnamed_test;
-                try namespace.test_decls.append(gpa, nav);
+                try (try namespace.rareLists(gpa)).test_decls.append(gpa, nav);
                 // TODO: incremental compilation!
                 // * remove from `test_functions` if no longer matching filter
                 // * add to `test_functions` if newly passing filter
@@ -3247,7 +3596,8 @@ const ScanDeclIter = struct {
                 if (!comp.config.is_test) break :a false;
                 if (file.mod != zcu.main_mod) break :a false;
                 if (is_named and comp.test_filters.len > 0) {
-                    const fqn_slice = fqn.toSlice(ip);
+                    const test_fqn = if (lazy_fqn) try namespace.internFullyQualifiedName(ip, gpa, io, pt.tid, name) else fqn;
+                    const fqn_slice = test_fqn.toSlice(ip);
                     for (comp.test_filters) |test_filter| {
                         if (std.mem.find(u8, fqn_slice, test_filter) != null) break;
                     } else break :a false;
@@ -3257,9 +3607,12 @@ const ScanDeclIter = struct {
             },
             .@"const", .@"var" => a: {
                 if (decl.is_pub) {
-                    try namespace.pub_decls.putContext(gpa, nav, {}, .{ .zcu = zcu });
+                    try namespace.pub_decls.putNoClobber(gpa, name, .fromNav(nav));
                 } else {
-                    try namespace.priv_decls.putContext(gpa, nav, {}, .{ .zcu = zcu });
+                    try namespace.priv_decls.putNoClobber(gpa, name, .fromNav(nav));
+                }
+                if (decl.linkage == .@"export") {
+                    try (try namespace.rareLists(gpa)).export_decls.append(gpa, .{ .nav = nav, .is_pub = decl.is_pub });
                 }
                 break :a false;
             },
@@ -3292,7 +3645,8 @@ fn analyzeFuncBodyInner(
         ip.getNav(zcu.funcInfo(func.generic_owner).owner_nav).analysis.?;
 
     const file = zcu.fileByIndex(decl_analysis.zir_index.resolveFile(ip));
-    const zir = file.zir.?;
+    const zir = file.pinZir(zcu);
+    defer file.unpinZir();
 
     try zcu.analysis_in_progress.putNoClobber(gpa, anal_unit, reason);
     defer assert(zcu.analysis_in_progress.swapRemove(anal_unit));
@@ -3393,6 +3747,7 @@ fn analyzeFuncBodyInner(
         },
         .type_name_ctx = func_nav.name,
         .type_fqn_ctx = func_nav.fqn,
+        .type_fqn_nav = func.owner_nav.toOptional(),
     };
     defer inner_block.instructions.deinit(gpa);
 
@@ -3643,7 +3998,7 @@ pub fn processExports(pt: Zcu.PerThread) (Allocator.Error || Io.Cancelable)!void
     var alive_exports: std.ArrayList(Zcu.Export.Index) = .empty;
     defer alive_exports.deinit(gpa);
 
-    const unit_references = try zcu.resolveReferences();
+    const unit_references = try zcu.referencedUnits();
 
     try alive_exports.ensureUnusedCapacity(gpa, zcu.single_exports.count());
     for (zcu.single_exports.keys(), zcu.single_exports.values()) |exporter, export_idx| {
@@ -3734,10 +4089,12 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
     if (builtin_root_type == .none) return; // `@import("builtin")` never analyzed
     const builtin_namespace = Type.fromInterned(builtin_root_type).getNamespace(zcu).unwrap().?;
     // We know that the namespace has a `test_functions`...
-    const test_fns_nav_index = zcu.namespacePtr(builtin_namespace).pub_decls.getKeyAdapted(
-        try ip.getOrPutString(gpa, io, pt.tid, "test_functions", .no_embedded_nulls),
-        Zcu.Namespace.NameAdapter{ .zcu = zcu },
-    ).?;
+    const test_fns_name = try ip.getOrPutString(gpa, io, pt.tid, "test_functions", .no_embedded_nulls);
+    const test_fns_nav_index = try pt.declSlotNav(
+        builtin_namespace,
+        test_fns_name,
+        zcu.namespacePtr(builtin_namespace).pub_decls.getPtr(test_fns_name).?,
+    );
     const test_fns_nav = ip.getNav(test_fns_nav_index);
     // ...but it might not be populated, so let's check that!
     if (zcu.failed_analysis.contains(.wrap(.{ .nav_val = test_fns_nav_index })) or
@@ -3762,8 +4119,6 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
         defer gpa.free(test_fn_vals);
 
         for (test_fn_vals, zcu.test_functions.keys()) |*test_fn_val, test_nav_index| {
-            const test_nav = ip.getNav(test_nav_index);
-
             {
                 // The test declaration might have failed; if that's the case, just return, as we'll
                 // be emitting a compile error anyway.
@@ -3775,7 +4130,7 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
                 }
             }
 
-            const test_nav_name = test_nav.fqn;
+            const test_nav_name = try pt.navFqn(test_nav_index);
             const test_nav_name_len = test_nav_name.length(ip);
             const test_name_anon_decl: InternPool.Key.Ptr.BaseAddr.Uav = n: {
                 const test_name_ty = try pt.arrayType(.{
@@ -3846,7 +4201,7 @@ pub fn populateTestFunctions(pt: Zcu.PerThread) Allocator.Error!void {
         } });
         var new_resolved_test_fns = test_fns_nav.resolved.?;
         new_resolved_test_fns.value = new_init;
-        ip.resolveNav(io, test_fns_nav_index, new_resolved_test_fns);
+        try ip.resolveNav(gpa, io, test_fns_nav_index, new_resolved_test_fns);
     }
     // The linker thread is not running, so we actually need to dispatch this task directly.
     @import("../link.zig").linkTestFunctionsNav(pt, test_fns_nav_index);
@@ -4398,7 +4753,9 @@ pub fn ensureNamespaceUpToDate(pt: Zcu.PerThread, namespace_index: Zcu.Namespace
 
     const inst_info = key.zir_index.resolveFull(ip) orelse return error.LostZirContainerDecl;
     const file = zcu.fileByIndex(inst_info.file);
-    const zir = &file.zir.?;
+    _ = file.pinZir(zcu);
+    defer file.unpinZir();
+    const zir = file.getZirPtr(zcu);
 
     const decls = switch (container) {
         .@"struct" => zir.getStructDecl(inst_info.inst).decls,
@@ -4433,6 +4790,9 @@ pub fn uavValue(pt: Zcu.PerThread, val: Value) Zcu.SemaError!Value {
 
 pub fn addDependency(pt: Zcu.PerThread, unit: AnalUnit, dependee: InternPool.Dependee) Allocator.Error!void {
     const zcu = pt.zcu;
+    // Dependencies say what a later update must re-analyze. A low-memory compile (a ZIR budget:
+    // the device compiler) without incremental updates has no later update that reads them.
+    if (!zcu.comp.config.incremental and zcu.zir_budget != 0) return;
     const gpa = zcu.comp.gpa;
     try zcu.intern_pool.addDependency(gpa, unit, dependee);
     if (zcu.comp.debugIncremental()) {

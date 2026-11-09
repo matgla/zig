@@ -2908,7 +2908,7 @@ pub const Object = struct {
                         );
                     }
 
-                    const ty = try o.builder.opaqueType(try o.builder.string(t.containerTypeName(ip).fqn.toSlice(ip)));
+                    const ty = try o.builder.opaqueType(try containerFqnString(&o.builder, o.gpa, ip, t.containerTypeName(ip).fqn));
                     try o.type_map.put(o.gpa, t.toIntern(), ty);
 
                     o.builder.namedTypeSetBody(
@@ -2998,7 +2998,7 @@ pub const Object = struct {
                     };
 
                     if (layout.tag_size == 0) {
-                        const ty = try o.builder.opaqueType(try o.builder.string(t.containerTypeName(ip).fqn.toSlice(ip)));
+                        const ty = try o.builder.opaqueType(try containerFqnString(&o.builder, o.gpa, ip, t.containerTypeName(ip).fqn));
                         try o.type_map.put(o.gpa, t.toIntern(), ty);
 
                         o.builder.namedTypeSetBody(
@@ -3026,7 +3026,7 @@ pub const Object = struct {
                         llvm_fields_len += 1;
                     }
 
-                    const ty = try o.builder.opaqueType(try o.builder.string(t.containerTypeName(ip).fqn.toSlice(ip)));
+                    const ty = try o.builder.opaqueType(try containerFqnString(&o.builder, o.gpa, ip, t.containerTypeName(ip).fqn));
                     try o.type_map.put(o.gpa, t.toIntern(), ty);
 
                     o.builder.namedTypeSetBody(
@@ -4740,4 +4740,17 @@ pub fn initializeLLVMTarget(io: Io, arch: std.Target.Cpu.Arch) void {
         .xtensaeb,
         => unreachable,
     }
+}
+
+/// A container type's fully qualified name as a `Builder.String` (see `InternPool.ContainerFqn`).
+fn containerFqnString(
+    builder: *Builder,
+    gpa: Allocator,
+    ip: *const InternPool,
+    fqn: InternPool.ContainerFqn,
+) Allocator.Error!Builder.String {
+    if (fqn.asString()) |s| return builder.string(s.toSlice(ip));
+    const text = try std.fmt.allocPrint(gpa, "{f}", .{fqn.fmt(ip)});
+    defer gpa.free(text);
+    return builder.string(text);
 }

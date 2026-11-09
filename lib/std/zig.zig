@@ -882,8 +882,15 @@ pub fn putAstErrorsIntoBundle(
 }
 
 pub fn resolveTargetQueryOrFatal(io: Io, target_query: std.Target.Query) std.Target {
+    if (target_query.cpu_arch) |arch| fatalWithoutCpuTables(arch);
     return system.resolveTargetQuery(io, target_query) catch |err|
         std.process.fatal("unable to resolve target: {t}", .{err});
+}
+
+/// A program built with `std.Options.cpu_families` cannot resolve the CPU of other architectures.
+fn fatalWithoutCpuTables(arch: std.Target.Cpu.Arch) void {
+    if (arch.hasCpuTables()) return;
+    std.process.fatal("this compiler was built without support for the '{t}' architecture family", .{arch.family()});
 }
 
 pub fn parseTargetQueryOrReportFatalError(
@@ -897,6 +904,7 @@ pub fn parseTargetQueryOrReportFatalError(
     }
     return std.Target.Query.parse(opts_with_diags) catch |err| switch (err) {
         error.UnknownCpuModel => {
+            fatalWithoutCpuTables(diags.arch.?);
             help: {
                 var help_text = std.array_list.Managed(u8).init(allocator);
                 defer help_text.deinit();
@@ -910,6 +918,7 @@ pub fn parseTargetQueryOrReportFatalError(
             std.process.fatal("unknown CPU: '{s}'", .{diags.cpu_name.?});
         },
         error.UnknownCpuFeature => {
+            fatalWithoutCpuTables(diags.arch.?);
             help: {
                 var help_text = std.array_list.Managed(u8).init(allocator);
                 defer help_text.deinit();
@@ -1529,6 +1538,10 @@ pub const Directories = struct {
         },
         environ_map: *const std.process.Environ.Map,
         cwd: []const u8,
+        /// Lib directories (each holding `std/std.zig`) to try, in order, when none is found
+        /// relative to the executable: an installation whose lib cannot sit next to the binary,
+        /// such as one in a read-only image with the lib on other storage.
+        zig_lib_search: []const []const u8 = &.{},
     };
 
     /// Uses `std.process.fatal` on error conditions.
@@ -1540,6 +1553,15 @@ pub const Directories = struct {
             if (options.override_zig_lib) |path| break :d openUnresolved(arena, io, cwd, path, .@"zig lib");
             if (wasi) break :d getPreopen(options.preopens, "/lib");
             break :d findZigLibDirFromSelfExe(arena, io, cwd, options.self_exe_path) catch |err| {
+                for (options.zig_lib_search) |path| {
+                    var dir = Dir.cwd().openDir(io, path, .{}) catch continue;
+                    const file = dir.openFile(io, "std" ++ Dir.path.sep_str ++ "std.zig", .{}) catch {
+                        dir.close(io);
+                        continue;
+                    };
+                    file.close(io);
+                    break :d .{ .handle = dir, .path = path };
+                }
                 fatal("unable to find zig installation directory from executable path {q}: {t}", .{
                     options.self_exe_path, err,
                 });

@@ -242,7 +242,7 @@ fn handleCommand(zcu: *Zcu, w: *Io.Writer, cmd_str: []const u8, arg_str: []const
         var num_results: usize = 0;
         for (zcu.incremental_debug_state.types.keys()) |type_ip_index| {
             const ty: Type = .fromInterned(type_ip_index);
-            const ty_name = ty.containerTypeName(ip).fqn.toSlice(ip);
+            const ty_name = ty.containerTypeName(ip).fqn.asString().?.toSlice(ip); // never derived when incremental
             const success = switch (@as(u2, @intFromBool(anchor_start)) << 1 | @intFromBool(anchor_end)) {
                 0b00 => std.mem.find(u8, ty_name, query) != null,
                 0b01 => std.mem.endsWith(u8, ty_name, query),
@@ -354,19 +354,19 @@ fn handleCommand(zcu: *Zcu, w: *Io.Writer, cmd_str: []const u8, arg_str: []const
         if (!zcu.incremental_debug_state.types.contains(ip_index)) return w.writeAll("unknown type");
         const ns = zcu.namespacePtr(Type.fromInterned(ip_index).getNamespaceIndex(zcu));
         try w.print("{d} pub decls:\n", .{ns.pub_decls.count()});
-        for (ns.pub_decls.keys()) |nav| {
-            try w.print("* nav {d}\n", .{@backingInt(nav)});
+        for (ns.pub_decls.values()) |slot| {
+            try w.print("* nav {d}\n", .{@backingInt(slot.nav())});
         }
         try w.print("{d} non-pub decls:\n", .{ns.priv_decls.count()});
-        for (ns.priv_decls.keys()) |nav| {
-            try w.print("* nav {d}\n", .{@backingInt(nav)});
+        for (ns.priv_decls.values()) |slot| {
+            try w.print("* nav {d}\n", .{@backingInt(slot.nav())});
         }
-        try w.print("{d} comptime decls:\n", .{ns.comptime_decls.items.len});
-        for (ns.comptime_decls.items) |id| {
+        try w.print("{d} comptime decls:\n", .{ns.comptimeDecls().len});
+        for (ns.comptimeDecls()) |id| {
             try w.print("* comptime {d}\n", .{@backingInt(id)});
         }
-        try w.print("{d} tests:\n", .{ns.test_decls.items.len});
-        for (ns.test_decls.items) |nav| {
+        try w.print("{d} tests:\n", .{ns.testDecls().len});
+        for (ns.testDecls()) |nav| {
             try w.print("* nav {d}\n", .{@backingInt(nav)});
         }
     } else {

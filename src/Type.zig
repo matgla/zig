@@ -533,9 +533,8 @@ pub fn print(ty: Type, writer: *std.Io.Writer, zcu: *Zcu, ctx: ?*Comparison) std
             return;
         },
         .inferred_error_set_type => |func_index| {
-            const func_nav = ip.getNav(zcu.funcInfo(func_index).owner_nav);
             try writer.print("@typeInfo(@typeInfo(@TypeOf({f})).@\"fn\".return_type.?).error_union.error_set", .{
-                func_nav.fqn.fmt(ip),
+                zcu.fmtNavFqn(zcu.funcInfo(func_index).owner_nav),
             });
         },
         .error_set_type => |error_set_type| {
@@ -2683,7 +2682,7 @@ pub fn typeDeclSrcLine(ty: Type, zcu: *Zcu) ?u32 {
     const info = tracked.resolveFull(&zcu.intern_pool) orelse return null;
     const file = zcu.fileByIndex(info.file);
     const zir = switch (file.getMode()) {
-        .zig => file.zir.?,
+        .zig => file.getZir(zcu),
         .zon => return 0,
     };
     const inst = zir.instructions.get(@backingInt(info.inst));
@@ -3009,7 +3008,7 @@ pub fn fieldPtrAlign(
 
 pub fn containerTypeName(ty: Type, ip: *const InternPool) struct {
     name: InternPool.NullTerminatedString,
-    fqn: InternPool.NullTerminatedString,
+    fqn: InternPool.ContainerFqn,
 } {
     switch (ip.indexToKey(ty.toIntern())) {
         .struct_type => {

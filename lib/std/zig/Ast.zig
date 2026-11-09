@@ -150,9 +150,10 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, options: ParseOptions) Alloca
     var tokens = Ast.TokenList{};
     defer tokens.deinit(gpa);
 
-    // Empirically, the zig std lib has an 8:1 ratio of source bytes to token count.
-    const estimated_token_count = source.len / 8;
-    try tokens.ensureTotalCapacity(gpa, estimated_token_count);
+    // Empirically, the zig std lib has about one token per 5.5 source bytes (median; one
+    // per 4 at the densest). Reserved exactly: the list is trimmed once tokenized.
+    const estimated_token_count = source.len / 5;
+    try tokens.setCapacity(gpa, estimated_token_count);
 
     var tokenizer = std.zig.Tokenizer.init(source);
     while (true) {
@@ -163,6 +164,8 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, options: ParseOptions) Alloca
         });
         if (token.tag == .eof) break;
     }
+    // Growth leaves up to half the capacity unused; give it back before the nodes are allocated.
+    tokens.shrinkAndFree(gpa, tokens.len);
 
     var tokens_slice = tokens.toOwnedSlice();
     errdefer tokens_slice.deinit(gpa);
@@ -203,8 +206,8 @@ pub fn parseTokens(
 
     try parser.extra_data.shrinkToLen(gpa);
     try parser.errors.shrinkToLen(gpa);
+    parser.nodes.shrinkAndFree(gpa, parser.nodes.len);
 
-    // TODO experiment with compacting the MultiArrayList slices here
     return .{
         .source = source,
         .mode = options.mode,

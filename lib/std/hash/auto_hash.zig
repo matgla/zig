@@ -97,10 +97,20 @@ pub fn hash(hasher: anytype, key: anytype, comptime strat: HashStrategy) void {
                 if (std.meta.hasUniqueRepresentation(Key)) {
                     @call(.always_inline, Hasher.update, .{ hasher, std.mem.asBytes(&key) });
                 } else {
-                    // Take only the part containing the key value, the remaining
-                    // bytes are undefined and must not be hashed!
+                    // Write the value out rather than reading the key's own
+                    // bytes. Trimming to the bytes that contain the value (as
+                    // this used to) still leaves the padding BITS above
+                    // @bitSizeOf(Key) inside the last byte, and their contents
+                    // are not specified -- so the same value could hash
+                    // differently depending on what was in that memory. That is
+                    // not hypothetical: on the YasOS port every `u6` enum (an
+                    // architecture tag, say) hashed differently each time, which
+                    // made `@import("builtin")` unresolvable because its module
+                    // is keyed by such a hash.
                     const byte_size = @divCeil(@bitSizeOf(Key), 8);
-                    @call(.always_inline, Hasher.update, .{ hasher, std.mem.asBytes(&key)[0..byte_size] });
+                    var bytes: [byte_size]u8 = undefined;
+                    std.mem.writeInt(@Int(.unsigned, byte_size * 8), &bytes, key, .little);
+                    @call(.always_inline, Hasher.update, .{ hasher, &bytes });
                 }
             },
         },

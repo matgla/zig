@@ -2080,6 +2080,8 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
                 .std_mod = std_mod,
                 .global_zir_cache = global_zir_cache,
                 .local_zir_cache = local_zir_cache,
+                .zir_budget = Zcu.defaultZirBudget(),
+                .zir_sticky = Zcu.defaultZirSticky(Zcu.defaultZirBudget()),
                 .error_limit = error_limit,
                 .llvm_object = null,
                 .analysis_roots_buffer = undefined,
@@ -3002,6 +3004,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
             link.updateErrorData(pt);
 
             try pt.processExports();
+            if (!comp.config.incremental) try zcu.freeReferenceEdges(anyErrors(comp));
         }
 
         if (build_options.enable_debug_extensions and comp.verbose_intern_pool) {
@@ -3023,6 +3026,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
 
     if (anyErrors(comp)) {
         // Skip flushing and keep source files loaded for error reporting.
+        if (dev.env.supports(.c_linker) and !comp.config.incremental) if (comp.bin_file) |lf| if (lf.cast(.c)) |c| c.closeSpill();
         return;
     }
 
@@ -3034,6 +3038,7 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
         if (comp.emit_llvm_bc) |path| try comp.emitFromCObject(arena, c_obj_path, ".bc", path);
     }
 
+    defer if (comp.zcu) |zcu| zcu.writeSizeHints();
     switch (comp.cache_use) {
         .none, .incremental => try flush(comp, arena),
         .whole => |whole| {

@@ -187,6 +187,8 @@ pub const Env = enum {
                 .legalize,
                 .c_backend,
                 .c_linker,
+                // A device compiler (YasOS) still says which version it is.
+                .version_command,
                 => true,
                 else => Env.sema.supports(feature),
             },

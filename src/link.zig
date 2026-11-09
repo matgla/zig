@@ -879,7 +879,7 @@ pub const File = struct {
         {
             const ti = ti_id.resolveFull(&pt.zcu.intern_pool).?;
             const file = pt.zcu.fileByIndex(ti.file);
-            const inst = file.zir.?.instructions.get(@backingInt(ti.inst));
+            const inst = file.getZir(pt.zcu).instructions.get(@backingInt(ti.inst));
             switch (inst.tag) {
                 .declaration => {},
                 .extended => switch (inst.data.extended.opcode) {
@@ -1851,7 +1851,7 @@ pub fn doZcuTask(comp: *Compilation, tid: Zcu.PerThread.Id, task: ZcuTask) void 
             break :nav ip.indexToKey(func).func.owner_nav;
         },
         .debug_update_container_type => |container_update| nav: {
-            const fqn = Type.fromInterned(container_update.ty).containerTypeName(ip).fqn.toSlice(ip);
+            const fqn = Type.fromInterned(container_update.ty).containerTypeName(ip).name.toSlice(ip);
             const ty_prog_node = comp.link_prog_node.start(fqn, 0);
             defer ty_prog_node.end();
             (if (zcu.llvm_object) |llvm_object|

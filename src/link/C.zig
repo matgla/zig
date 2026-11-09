@@ -5,6 +5,7 @@
 const C = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mem = std.mem;
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -46,7 +47,13 @@ align_dependency_masks: std.ArrayList(u64),
 /// Emitted at the top of the file. This can be cached since it only depends on the target.
 header: String,
 /// All NAVs, regardless of whether they are functions or simple constants, are put in this map.
-navs: std.array_hash_map.Auto(InternPool.Nav.Index, RenderedDecl),
+navs: std.array_hash_map.Auto(InternPool.Nav.Index, NavSlot),
+/// The `RenderedDecl`s of `navs` held in memory, by `NavSlot.index`; free ones are `.init`.
+nav_decls: std.ArrayList(RenderedDecl) = .empty,
+nav_decls_free: std.ArrayList(u31) = .empty,
+/// The needs of a function in `navs` that few have, for those that have any: three empty maps in
+/// every `RenderedDecl` were most of its size.
+nav_rare_needs: std.array_hash_map.Auto(InternPool.Nav.Index, RareNeeds) = .empty,
 /// All UAVs which may be referenced are in this map. The UAV alignment is not included in the
 /// rendered C code stored here, because we don't know the alignment a UAV needs until `flush`.
 uavs: std.array_hash_map.Auto(InternPool.Index, RenderedDecl),
@@ -56,7 +63,10 @@ type_pool: link.ConstPool,
 /// Indices are `link.ConstPool.Index` from `type_pool`. Contains rendered C code for every type
 /// which may be referenced. Logic in `flush` will perform the appropriate topological sort to emit
 /// these type definitions in an order which C allows.
-types: std.ArrayList(RenderedType),
+types: std.ArrayList(TypeSlot),
+/// The `RenderedType`s of `types` held in memory, by `TypeSlot.index`.
+type_decls: std.ArrayList(RenderedType) = .empty,
+type_decls_free: std.ArrayList(u31) = .empty,
 
 /// The set of big int types required by *any* generated code so far. These are always safe to emit,
 /// so they do not participate in the dependency graph traversal in `flush`. Therefore, redundant
@@ -66,7 +76,19 @@ bigint_types: std.array_hash_map.Auto(codegen.CType.BigInt, void),
 exported_navs: std.array_hash_map.Auto(InternPool.Nav.Index, String),
 exported_uavs: std.array_hash_map.Auto(InternPool.Index, String),
 
-/// A reference into `string_bytes`.
+/// `ZIG_C_SPILL_DIR` (a device compiler on YasOS: the SD card): function bodies and forward
+/// declarations -- most of the C output, which otherwise all waits in `string_bytes` for `flush`
+/// (14 MB of a 37 MB peak for the YasOS kernel) -- are appended to a file there as they are
+/// rendered, and `flush` copies them into the output. -1 when off.
+spill_fd: c_int = -1,
+spill_len: u32 = 0,
+/// Cleared when a write fails: the bodies spilled so far stay readable, the rest go to memory.
+spill_writable: bool = true,
+/// A read moved the file's position: the next write seeks back to `spill_len` first.
+spill_pos_moved: bool = false,
+spill_path: [:0]const u8 = "",
+
+/// A reference into `string_bytes`, or (`spilled` bit set in `start`) into the spill file.
 const String = extern struct {
     start: u32,
     len: u32,
@@ -76,17 +98,28 @@ const String = extern struct {
         .len = 0,
     };
 
+    const spilled: u32 = 1 << 31;
+
+    fn isSpilled(s: String) bool {
+        return s.start & spilled != 0;
+    }
+
     fn get(s: String, c: *C) []const u8 {
+        assert(!s.isSpilled());
         return c.string_bytes.items[s.start..][0..s.len];
     }
 };
 
+/// Counts as u16 (`addCTypeDependencies` checks): one of these is in every `RenderedDecl` and two
+/// in every `RenderedType`.
 const CTypeDependencies = struct {
-    len: u32,
-    errunion_len: u32,
-    fwd_len: u32,
-    errunion_fwd_len: u32,
-    aligned_fwd_len: u32,
+    len: u16,
+    errunion_len: u16,
+    fwd_len: u16,
+    errunion_fwd_len: u16,
+    aligned_fwd_len: u16,
+    /// With the spill file: `type_start` and `align_mask_start` are offsets there (`getOwned`).
+    spilled: bool = false,
 
     /// Index into `C.type_dependencies`. Starting at this index are:
     /// * `len` dependencies on complete types
@@ -108,14 +141,57 @@ const CTypeDependencies = struct {
         aligned_type_masks: []const u64,
     };
 
+    /// `get`, or with the dependencies in the spill file a copy of them; `deinit` frees it.
+    const Owned = struct {
+        resolved: Resolved,
+        types: []link.ConstPool.Index = &.{},
+        masks: []u64 = &.{},
+
+        fn deinit(o: *Owned, gpa: Allocator) void {
+            gpa.free(o.types);
+            gpa.free(o.masks);
+        }
+    };
+
+    fn getOwned(td: *const CTypeDependencies, c: *C) link.Error!Owned {
+        if (!td.spilled) return .{ .resolved = td.get(c) };
+        const gpa = c.base.comp.gpa;
+        const len: usize = td.len;
+        const errunion_len: usize = td.errunion_len;
+        const fwd_len: usize = td.fwd_len;
+        const errunion_fwd_len: usize = td.errunion_fwd_len;
+        const total = len + errunion_len + fwd_len + errunion_fwd_len + td.aligned_fwd_len;
+        var o: Owned = .{ .resolved = undefined };
+        errdefer o.deinit(gpa);
+        o.types = try gpa.alloc(link.ConstPool.Index, total);
+        o.masks = try gpa.alloc(u64, td.aligned_fwd_len);
+        try c.readSpill(td.type_start, std.mem.sliceAsBytes(o.types));
+        if (o.masks.len != 0) try c.readSpill(td.align_mask_start, std.mem.sliceAsBytes(o.masks));
+        const t = o.types;
+        o.resolved = .{
+            .type = t[0..len],
+            .errunion_type = t[len..][0..errunion_len],
+            .type_fwd = t[len + errunion_len ..][0..fwd_len],
+            .errunion_type_fwd = t[len + errunion_len + fwd_len ..][0..errunion_fwd_len],
+            .aligned_type_fwd = t[len + errunion_len + fwd_len + errunion_fwd_len ..][0..td.aligned_fwd_len],
+            .aligned_type_masks = o.masks,
+        };
+        return o;
+    }
+
     fn get(td: *const CTypeDependencies, c: *const C) Resolved {
+        assert(!td.spilled);
         const types_overlong = c.type_dependencies.items[td.type_start..];
+        const len: usize = td.len;
+        const errunion_len: usize = td.errunion_len;
+        const fwd_len: usize = td.fwd_len;
+        const errunion_fwd_len: usize = td.errunion_fwd_len;
         return .{
-            .type = types_overlong[0..td.len],
-            .errunion_type = types_overlong[td.len..][0..td.errunion_len],
-            .type_fwd = types_overlong[td.len + td.errunion_len ..][0..td.fwd_len],
-            .errunion_type_fwd = types_overlong[td.len + td.errunion_len + td.fwd_len ..][0..td.errunion_fwd_len],
-            .aligned_type_fwd = types_overlong[td.len + td.errunion_len + td.fwd_len + td.errunion_fwd_len ..][0..td.aligned_fwd_len],
+            .type = types_overlong[0..len],
+            .errunion_type = types_overlong[len..][0..errunion_len],
+            .type_fwd = types_overlong[len + errunion_len ..][0..fwd_len],
+            .errunion_type_fwd = types_overlong[len + errunion_len + fwd_len ..][0..errunion_fwd_len],
+            .aligned_type_fwd = types_overlong[len + errunion_len + fwd_len + errunion_fwd_len ..][0..td.aligned_fwd_len],
             .aligned_type_masks = c.align_dependency_masks.items[td.align_mask_start..][0..td.aligned_fwd_len],
         };
     }
@@ -131,30 +207,42 @@ const CTypeDependencies = struct {
     };
 };
 
+/// Where a NAV's `RenderedDecl` is: in `nav_decls`, or -- with the spill file, once the NAV
+/// is rendered -- a record in the spill file at `index` (`spillNav`), read back by the flush.
+const NavSlot = packed struct(u32) {
+    index: u31,
+    spilled: bool,
+};
+
+/// A `RenderedDecl` as `spillNav` writes it; its `need_uavs` follow, `uavs` of `SpilledUav`.
+const SpilledNavHeader = struct {
+    fwd_decl: String,
+    code: String,
+    ctype_deps: CTypeDependencies,
+    uavs: u32,
+};
+const SpilledUav = extern struct { val: InternPool.Index, alignment: u32 };
+
+/// Where a C type's `RenderedType` is: like `NavSlot`, spilled once `updateConst` or
+/// `updateConstIncomplete` completed it (`spillType`).
+const TypeSlot = NavSlot;
+
 const RenderedDecl = struct {
     fwd_decl: String,
     code: String,
     ctype_deps: CTypeDependencies,
     need_uavs: std.array_hash_map.Auto(InternPool.Index, Alignment),
-    need_tag_name_funcs: std.array_hash_map.Auto(InternPool.Index, void),
-    need_never_tail_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
-    need_never_inline_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
+    // The others are in `C.nav_rare_needs`.
 
     const init: RenderedDecl = .{
         .fwd_decl = .empty,
         .code = .empty,
         .ctype_deps = .empty,
         .need_uavs = .empty,
-        .need_tag_name_funcs = .empty,
-        .need_never_tail_funcs = .empty,
-        .need_never_inline_funcs = .empty,
     };
 
     fn deinit(rd: *RenderedDecl, gpa: Allocator) void {
         rd.need_uavs.deinit(gpa);
-        rd.need_tag_name_funcs.deinit(gpa);
-        rd.need_never_tail_funcs.deinit(gpa);
-        rd.need_never_inline_funcs.deinit(gpa);
         rd.* = undefined;
     }
 
@@ -165,11 +253,28 @@ const RenderedDecl = struct {
         rd.fwd_decl = undefined;
         rd.code = undefined;
         rd.need_uavs.clearRetainingCapacity();
-        rd.need_tag_name_funcs.clearRetainingCapacity();
-        rd.need_never_tail_funcs.clearRetainingCapacity();
-        rd.need_never_inline_funcs.clearRetainingCapacity();
     }
 };
+
+const RareNeeds = struct {
+    tag_name_funcs: std.array_hash_map.Auto(InternPool.Index, void),
+    never_tail_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
+    never_inline_funcs: std.array_hash_map.Auto(InternPool.Nav.Index, void),
+
+    fn deinit(rn: *RareNeeds, gpa: Allocator) void {
+        rn.tag_name_funcs.deinit(gpa);
+        rn.never_tail_funcs.deinit(gpa);
+        rn.never_inline_funcs.deinit(gpa);
+        rn.* = undefined;
+    }
+};
+
+fn dropRareNeeds(c: *C, nav: InternPool.Nav.Index) void {
+    if (c.nav_rare_needs.fetchSwapRemove(nav)) |kv| {
+        var old = kv.value;
+        old.deinit(c.base.comp.gpa);
+    }
+}
 
 const RenderedType = struct {
     /// If this type lowers to an aggregate, this is a forward declaration of its struct/union tag.
@@ -217,7 +322,7 @@ pub fn addConst(
 
     const ty: Type = .fromInterned(val);
 
-    const fwd_decl: String = fwd_decl: {
+    const fwd_decl: String = c.spillString(fwd_decl: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
         defer c.string_bytes = aw.toArrayList();
         const start = aw.written().len;
@@ -228,9 +333,9 @@ pub fn addConst(
             .start = @intCast(start),
             .len = @intCast(aw.written().len - start),
         };
-    };
+    });
 
-    const errunion_fwd_decl: String = errunion_fwd_decl: {
+    const errunion_fwd_decl: String = c.spillString(errunion_fwd_decl: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
         defer c.string_bytes = aw.toArrayList();
         const start = aw.written().len;
@@ -241,9 +346,11 @@ pub fn addConst(
             .start = @intCast(start),
             .len = @intCast(aw.written().len - start),
         };
-    };
+    });
 
-    try c.types.append(gpa, .{
+    const slot = try c.allocTypeDecl();
+    try c.types.append(gpa, slot);
+    c.type_decls.items[slot.index] = (.{
         .fwd_decl = fwd_decl,
         .errunion_fwd_decl = errunion_fwd_decl,
         // This field will be populated just below.
@@ -264,7 +371,7 @@ pub fn addConst(
         _ = try codegen.CType.lower(ty, &deps, arena.allocator(), zcu);
         // This call may add more items to `c.types`.
         const type_deps = try c.addCTypeDependencies(pt, &deps);
-        c.types.items[@backingInt(pool_index)].deps = type_deps;
+        (try c.typeDecl(pool_index)).deps = type_deps;
     }
 }
 
@@ -281,11 +388,12 @@ pub fn updateConstIncomplete(
     assert(zcu.intern_pool.typeOf(val) == .type_type);
     const ty: Type = .fromInterned(val);
 
-    const rendered: *RenderedType = &c.types.items[@backingInt(index)];
+    // Spilled only once complete, and completed once: this is in memory.
+    const rendered: *RenderedType = c.typeDecl(index) catch return error.OutOfMemory;
 
     rendered.errunion_definition = .empty;
     rendered.definition_deps = .empty;
-    rendered.definition = definition: {
+    rendered.definition = c.spillString(definition: {
         if (rendered.fwd_decl.len != 0) {
             // This is a struct or union type. We will never complete it, but we must forward
             // declare it to ensure that its first usage does not appear in a different scope.
@@ -302,7 +410,8 @@ pub fn updateConstIncomplete(
             .start = @intCast(start),
             .len = @intCast(aw.written().len - start),
         };
-    };
+    });
+    c.spillType(index);
 }
 /// Only called by `link.ConstPool` due to `c.type_pool`, so `val` is always a type.
 pub fn updateConst(
@@ -317,7 +426,7 @@ pub fn updateConst(
     assert(zcu.intern_pool.typeOf(val) == .type_type);
     const ty: Type = .fromInterned(val);
 
-    const rendered: *RenderedType = &c.types.items[@backingInt(index)];
+    const rendered: *RenderedType = try c.typeDecl(index);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -344,6 +453,7 @@ pub fn updateConst(
             .len = @intCast(aw.written().len - start),
         };
     }
+    rendered.errunion_definition = c.spillString(rendered.errunion_definition);
 
     deps.clearRetainingCapacity();
 
@@ -369,12 +479,14 @@ pub fn updateConst(
             .len = @intCast(aw.written().len - start),
         };
     }
+    rendered.definition = c.spillString(rendered.definition);
 
     {
         // This call invalidates `rendered`.
         const definition_deps = try c.addCTypeDependencies(pt, &deps);
-        c.types.items[@backingInt(index)].definition_deps = definition_deps;
+        (try c.typeDecl(index)).definition_deps = definition_deps;
     }
+    c.spillType(index);
 }
 
 fn addString(c: *C, vec: []const []const u8) Allocator.Error!String {
@@ -448,13 +560,206 @@ pub fn createEmpty(
         .exported_navs = .empty,
         .exported_uavs = .empty,
     };
+    if (builtin.link_libc) {
+        if (std.c.getenv("ZIG_C_SPILL_DIR")) |dir| c.openSpill(arena, std.mem.span(dir));
+    }
     return c;
+}
+
+fn openSpill(c: *C, arena: Allocator, dir: []const u8) void {
+    const path = std.fmt.allocPrintSentinel(arena, "{s}/zig-c-{d}.spill", .{ dir, std.c.getpid() }, 0) catch return;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return;
+    c.spill_fd = fd;
+    c.spill_path = path;
+}
+
+/// Like `addString`, into the spill file when there is one; back to memory if writing fails.
+fn addCode(c: *C, vec: []const []const u8) Allocator.Error!String {
+    return c.spillBytes(vec) orelse c.addString(vec);
+}
+
+/// A string just rendered at the end of `string_bytes` moves to the spill file when there is one.
+fn spillString(c: *C, s: String) String {
+    if (s.len == 0 or s.isSpilled() or s.start + s.len != c.string_bytes.items.len) return s;
+    const sp = c.spillBytes(&.{s.get(c)}) orelse return s;
+    c.string_bytes.shrinkRetainingCapacity(s.start);
+    return sp;
+}
+
+fn spillBytes(c: *C, vec: []const []const u8) ?String {
+    if (!builtin.link_libc) return null;
+    if (c.spill_fd < 0 or !c.spill_writable) return null;
+    var len: u32 = 0;
+    for (vec) |s| len += @intCast(s.len);
+    if (@as(u64, c.spill_len) + len >= String.spilled) return null;
+    if (c.spill_pos_moved) {
+        if (std.c.lseek(c.spill_fd, @intCast(c.spill_len), std.c.SEEK.SET) < 0) {
+            c.spill_writable = false;
+            return null;
+        }
+        c.spill_pos_moved = false;
+    }
+    for (vec) |s| {
+        var rest = s;
+        while (rest.len != 0) {
+            const n = std.c.write(c.spill_fd, rest.ptr, rest.len);
+            if (n <= 0) {
+                // Past spill_len the file is garbage: no more spilling, this one in memory.
+                c.spill_writable = false;
+                return null;
+            }
+            rest = rest[@intCast(n)..];
+        }
+    }
+    const start = c.spill_len;
+    c.spill_len += len;
+    return .{ .start = String.spilled | start, .len = len };
+}
+
+fn allocNavDecl(c: *C) Allocator.Error!NavSlot {
+    const gpa = c.base.comp.gpa;
+    const index = c.nav_decls_free.pop() orelse index: {
+        try c.nav_decls.append(gpa, .init);
+        break :index @as(u31, @intCast(c.nav_decls.items.len - 1));
+    };
+    return .{ .index = index, .spilled = false };
+}
+
+fn freeNavSlot(c: *C, slot: NavSlot) void {
+    if (slot.spilled) return;
+    const gpa = c.base.comp.gpa;
+    c.nav_decls.items[slot.index].deinit(gpa);
+    c.nav_decls.items[slot.index] = .init;
+    // If the list cannot grow, the entry stays unused: lost space, nothing worse.
+    c.nav_decls_free.append(gpa, slot.index) catch {};
+}
+
+/// With the spill file: the NAV's `RenderedDecl` goes there, and the memory it took goes back.
+/// The flush reads it again (`renderedNav`). Kept in memory if writing fails.
+fn spillNav(c: *C, nav: InternPool.Nav.Index) void {
+    if (!builtin.link_libc or c.spill_fd < 0 or !c.spill_writable) return;
+    const slot = c.navs.getPtr(nav).?;
+    if (slot.spilled) return;
+    const rd = &c.nav_decls.items[slot.index];
+    const header: SpilledNavHeader = .{
+        .fwd_decl = rd.fwd_decl,
+        .code = rd.code,
+        .ctype_deps = rd.ctype_deps,
+        .uavs = @intCast(rd.need_uavs.count()),
+    };
+    var uavs_buf: [64]SpilledUav = undefined;
+    // The header, then the uavs in map order (it decides the order they are emitted in), in
+    // pieces of up to 64.
+    const first = c.spillBytes(&.{std.mem.asBytes(&header)}) orelse return;
+    var done: usize = 0;
+    const keys = rd.need_uavs.keys();
+    const values = rd.need_uavs.values();
+    while (done < keys.len) {
+        const n: usize = @min(keys.len - done, uavs_buf.len);
+        for (uavs_buf[0..n], keys[done..][0..n], values[done..][0..n]) |*u, k, v| {
+            u.* = .{ .val = k, .alignment = @intFromEnum(v) };
+        }
+        _ = c.spillBytes(&.{std.mem.sliceAsBytes(uavs_buf[0..n])}) orelse return;
+        done += n;
+    }
+    c.freeNavSlot(slot.*);
+    slot.* = .{ .index = @intCast(first.start & ~String.spilled), .spilled = true };
+}
+
+/// The NAV's `RenderedDecl`: in memory, or read back from the spill file into `scratch` (whose
+/// `need_uavs` is reused).
+fn renderedNav(c: *C, nav: InternPool.Nav.Index, scratch: *RenderedDecl) link.Error!*const RenderedDecl {
+    const slot = c.navs.get(nav).?;
+    if (!slot.spilled) return &c.nav_decls.items[slot.index];
+    if (!builtin.link_libc) unreachable;
+    const gpa = c.base.comp.gpa;
+    var header: SpilledNavHeader = undefined;
+    try c.readSpill(slot.index, std.mem.asBytes(&header));
+    scratch.fwd_decl = header.fwd_decl;
+    scratch.code = header.code;
+    scratch.ctype_deps = header.ctype_deps;
+    scratch.need_uavs.clearRetainingCapacity();
+    try scratch.need_uavs.ensureTotalCapacity(gpa, header.uavs);
+    var uavs_buf: [64]SpilledUav = undefined;
+    var off: u64 = slot.index + @sizeOf(SpilledNavHeader);
+    var left: usize = header.uavs;
+    while (left != 0) {
+        const n: usize = @min(left, uavs_buf.len);
+        try c.readSpill(off, std.mem.sliceAsBytes(uavs_buf[0..n]));
+        for (uavs_buf[0..n]) |u| scratch.need_uavs.putAssumeCapacity(u.val, @enumFromInt(@as(u6, @intCast(u.alignment))));
+        off += n * @sizeOf(SpilledUav);
+        left -= n;
+    }
+    return scratch;
+}
+
+fn readSpill(c: *C, offset: u64, out: []u8) link.Error!void {
+    if (!builtin.link_libc) unreachable;
+    const diags = &c.base.comp.link_diags;
+    if (std.c.lseek(c.spill_fd, @intCast(offset), std.c.SEEK.SET) < 0)
+        return diags.fail("failed to read the C spill file '{s}'", .{c.spill_path});
+    c.spill_pos_moved = true;
+    var rest = out;
+    while (rest.len != 0) {
+        const n = std.c.read(c.spill_fd, rest.ptr, rest.len);
+        if (n <= 0) return diags.fail("failed to read the C spill file '{s}'", .{c.spill_path});
+        rest = rest[@intCast(n)..];
+    }
+}
+
+fn allocTypeDecl(c: *C) Allocator.Error!TypeSlot {
+    const gpa = c.base.comp.gpa;
+    const index = c.type_decls_free.pop() orelse index: {
+        try c.type_decls.append(gpa, undefined);
+        break :index @as(u31, @intCast(c.type_decls.items.len - 1));
+    };
+    return .{ .index = index, .spilled = false };
+}
+
+/// The type's `RenderedType` to change: in memory, read back from the spill file first if it is
+/// there. Invalidated by anything that adds a C type.
+fn typeDecl(c: *C, index: link.ConstPool.Index) link.Error!*RenderedType {
+    const slot = &c.types.items[@backingInt(index)];
+    if (!slot.spilled) return &c.type_decls.items[slot.index];
+    var rendered: RenderedType = undefined;
+    try c.readSpill(slot.index, std.mem.asBytes(&rendered));
+    const new = try c.allocTypeDecl();
+    c.type_decls.items[new.index] = rendered;
+    c.types.items[@backingInt(index)] = new;
+    return &c.type_decls.items[new.index];
+}
+
+/// The type's `RenderedType`, a copy.
+fn renderedType(c: *C, index: link.ConstPool.Index) link.Error!RenderedType {
+    const slot = c.types.items[@backingInt(index)];
+    if (!slot.spilled) return c.type_decls.items[slot.index];
+    var rendered: RenderedType = undefined;
+    try c.readSpill(slot.index, std.mem.asBytes(&rendered));
+    return rendered;
+}
+
+/// With the spill file: a completed type's `RenderedType` goes there (the flush reads it back).
+fn spillType(c: *C, index: link.ConstPool.Index) void {
+    if (!builtin.link_libc or c.spill_fd < 0 or !c.spill_writable) return;
+    const slot = &c.types.items[@backingInt(index)];
+    if (slot.spilled) return;
+    const s = c.spillBytes(&.{std.mem.asBytes(&c.type_decls.items[slot.index])}) orelse return;
+    // If the list cannot grow, the entry stays unused: lost space, nothing worse.
+    c.type_decls_free.append(c.base.comp.gpa, slot.index) catch {};
+    slot.* = .{ .index = @intCast(s.start & ~String.spilled), .spilled = true };
 }
 
 pub fn deinit(c: *C) void {
     const gpa = c.base.comp.gpa;
+    c.type_decls.deinit(gpa);
+    c.type_decls_free.deinit(gpa);
 
-    for (c.navs.values()) |*r| r.deinit(gpa);
+    for (c.nav_decls.items) |*r| r.deinit(gpa);
+    c.nav_decls.deinit(gpa);
+    c.nav_decls_free.deinit(gpa);
+    for (c.nav_rare_needs.values()) |*r| r.deinit(gpa);
+    c.nav_rare_needs.deinit(gpa);
     for (c.uavs.values()) |*r| r.deinit(gpa);
 
     c.string_bytes.deinit(gpa);
@@ -467,6 +772,10 @@ pub fn deinit(c: *C) void {
     c.bigint_types.deinit(gpa);
     c.exported_navs.deinit(gpa);
     c.exported_uavs.deinit(gpa);
+    if (builtin.link_libc and c.spill_path.len != 0) {
+        if (c.spill_fd >= 0) _ = std.c.close(c.spill_fd);
+        _ = std.c.unlink(c.spill_path);
+    }
 }
 
 pub fn prelink(c: *C, prog_node: std.Progress.Node) !void {
@@ -503,22 +812,31 @@ pub fn updateFunc(
     const gpa = zcu.gpa;
     const nav = zcu.funcInfo(func_index).owner_nav;
 
+    c.dropRareNeeds(nav);
+    if (mir.c.need_tag_name_funcs.count() != 0 or mir.c.need_never_tail_funcs.count() != 0 or
+        mir.c.need_never_inline_funcs.count() != 0)
+    {
+        try c.nav_rare_needs.putNoClobber(gpa, nav, .{
+            .tag_name_funcs = mir.c.need_tag_name_funcs.move(),
+            .never_tail_funcs = mir.c.need_never_tail_funcs.move(),
+            .never_inline_funcs = mir.c.need_never_inline_funcs.move(),
+        });
+    }
     const rendered_decl: *RenderedDecl = rd: {
+        const slot = try c.allocNavDecl();
         const gop = try c.navs.getOrPut(gpa, nav);
-        if (gop.found_existing) gop.value_ptr.deinit(gpa);
-        break :rd gop.value_ptr;
+        if (gop.found_existing) c.freeNavSlot(gop.value_ptr.*);
+        gop.value_ptr.* = slot;
+        break :rd &c.nav_decls.items[slot.index];
     };
     c.navs.lockPointers();
     defer c.navs.unlockPointers();
 
     rendered_decl.* = .{
-        .fwd_decl = try c.addString(&.{mir.c.fwd_decl}),
-        .code = try c.addString(&.{ mir.c.code_header, mir.c.code }),
+        .fwd_decl = try c.addCode(&.{mir.c.fwd_decl}),
+        .code = try c.addCode(&.{ mir.c.code_header, mir.c.code }),
         .ctype_deps = try c.addCTypeDependencies(pt, &mir.c.ctype_deps),
         .need_uavs = mir.c.need_uavs.move(),
-        .need_tag_name_funcs = mir.c.need_tag_name_funcs.move(),
-        .need_never_tail_funcs = mir.c.need_never_tail_funcs.move(),
-        .need_never_inline_funcs = mir.c.need_never_inline_funcs.move(),
     };
 
     const old_uavs_len = c.uavs.count();
@@ -534,6 +852,7 @@ pub fn updateFunc(
     try c.updateNewUavs(pt, old_uavs_len);
 
     try c.type_pool.flushPending(pt, .{ .c = c });
+    c.spillNav(nav);
 }
 
 pub fn updateNav(c: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link.Error!void {
@@ -551,23 +870,28 @@ pub fn updateNav(c: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link
         else => {
             const nav_ty: Type = .fromInterned(nav.resolved.?.type);
             if (!nav_ty.hasRuntimeBits(zcu)) {
-                if (c.navs.fetchSwapRemove(nav_index)) |kv| {
-                    var old_rendered = kv.value;
-                    old_rendered.deinit(gpa);
-                }
+                if (c.navs.fetchSwapRemove(nav_index)) |kv| c.freeNavSlot(kv.value);
+                c.dropRareNeeds(nav_index);
                 return;
             }
         },
     }
 
+    c.dropRareNeeds(nav_index);
     const rendered_decl: *RenderedDecl = rd: {
         const gop = try c.navs.getOrPut(gpa, nav_index);
-        if (gop.found_existing) {
-            gop.value_ptr.clearRetainingCapacity();
-        } else {
-            gop.value_ptr.* = .init;
+        if (gop.found_existing and !gop.value_ptr.spilled) {
+            const rd = &c.nav_decls.items[gop.value_ptr.index];
+            rd.clearRetainingCapacity();
+            break :rd rd;
         }
-        break :rd gop.value_ptr;
+        // `allocNavDecl` does not touch `navs`, so `gop` stays valid.
+        const slot = c.allocNavDecl() catch |err| {
+            if (!gop.found_existing) _ = c.navs.pop();
+            return err;
+        };
+        gop.value_ptr.* = slot;
+        break :rd &c.nav_decls.items[slot.index];
     };
     c.navs.lockPointers();
     defer c.navs.unlockPointers();
@@ -593,7 +917,7 @@ pub fn updateNav(c: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link
             dg.ctype_deps.deinit(gpa);
         }
 
-        rendered_decl.fwd_decl = fwd_decl: {
+        rendered_decl.fwd_decl = c.spillString(fwd_decl: {
             var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
             defer c.string_bytes = aw.toArrayList();
             const start = aw.written().len;
@@ -606,9 +930,9 @@ pub fn updateNav(c: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link
                 .start = @intCast(start),
                 .len = @intCast(aw.written().len - start),
             };
-        };
+        });
 
-        rendered_decl.code = code: {
+        rendered_decl.code = c.spillString(code: {
             var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
             defer c.string_bytes = aw.toArrayList();
             const start = aw.written().len;
@@ -621,7 +945,7 @@ pub fn updateNav(c: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link
                 .start = @intCast(start),
                 .len = @intCast(aw.written().len - start),
             };
-        };
+        });
 
         rendered_decl.ctype_deps = try c.addCTypeDependencies(pt, &dg.ctype_deps);
     }
@@ -639,6 +963,7 @@ pub fn updateNav(c: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link
     try c.updateNewUavs(pt, old_uavs_len);
 
     try c.type_pool.flushPending(pt, .{ .c = c });
+    c.spillNav(nav_index);
 }
 
 /// Unlike `updateNav` and `updateFunc`, this does *not* add newly-discovered UAVs to `c.uavs`. The
@@ -678,7 +1003,7 @@ fn updateUav(
         dg.ctype_deps.deinit(gpa);
     }
 
-    rendered_decl.fwd_decl = fwd_decl: {
+    rendered_decl.fwd_decl = c.spillString(fwd_decl: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
         defer c.string_bytes = aw.toArrayList();
         const start = aw.written().len;
@@ -696,9 +1021,9 @@ fn updateUav(
             .start = @intCast(start),
             .len = @intCast(aw.written().len - start),
         };
-    };
+    });
 
-    rendered_decl.code = code: {
+    rendered_decl.code = c.spillString(code: {
         var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
         defer c.string_bytes = aw.toArrayList();
         const start = aw.written().len;
@@ -716,7 +1041,7 @@ fn updateUav(
             .start = @intCast(start),
             .len = @intCast(aw.written().len - start),
         };
-    };
+    });
 
     rendered_decl.ctype_deps = try c.addCTypeDependencies(pt, &dg.ctype_deps);
 }
@@ -764,7 +1089,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     var need_navs: std.array_hash_map.Auto(InternPool.Nav.Index, void) = .empty;
     defer need_navs.deinit(gpa);
     {
-        const unit_references = try zcu.resolveReferences();
+        const unit_references = try zcu.referencedUnits();
         for (c.navs.keys()) |nav| {
             const nav_val = ip.getNav(nav).resolved.?.value;
             const check_unit: ?InternPool.AnalUnit = switch (ip.indexToKey(nav_val)) {
@@ -781,6 +1106,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
             }
             try need_navs.putNoClobber(gpa, nav, {});
         }
+        if (!comp.config.incremental and zcu.reference_edges_freed) zcu.dropReferencedUnits();
     }
 
     // Using our knowledge of which NAVs are referenced, we now need to discover the set of UAVs and
@@ -821,8 +1147,10 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     }
 
     // For every referenced NAV, some UAVs, C types, and lazy functions may be referenced.
+    var scratch: RenderedDecl = .init;
+    defer scratch.deinit(gpa);
     for (need_navs.keys()) |nav| {
-        const rendered = c.navs.getPtr(nav).?;
+        const rendered = try c.renderedNav(nav, &scratch);
         try mergeNeededCTypes(
             c,
             &need_types,
@@ -832,18 +1160,20 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
         );
         try mergeNeededUavs(zcu, &need_uavs, &rendered.need_uavs);
 
-        try need_tag_name_funcs.ensureUnusedCapacity(gpa, rendered.need_tag_name_funcs.count());
-        for (rendered.need_tag_name_funcs.keys()) |enum_type| {
+        const rare = c.nav_rare_needs.getPtr(nav) orelse continue;
+
+        try need_tag_name_funcs.ensureUnusedCapacity(gpa, rare.tag_name_funcs.count());
+        for (rare.tag_name_funcs.keys()) |enum_type| {
             need_tag_name_funcs.putAssumeCapacity(enum_type, {});
         }
 
-        try need_never_tail_funcs.ensureUnusedCapacity(gpa, rendered.need_never_tail_funcs.count());
-        for (rendered.need_never_tail_funcs.keys()) |fn_nav| {
+        try need_never_tail_funcs.ensureUnusedCapacity(gpa, rare.never_tail_funcs.count());
+        for (rare.never_tail_funcs.keys()) |fn_nav| {
             need_never_tail_funcs.putAssumeCapacity(fn_nav, {});
         }
 
-        try need_never_inline_funcs.ensureUnusedCapacity(gpa, rendered.need_never_inline_funcs.count());
-        for (rendered.need_never_inline_funcs.keys()) |fn_nav| {
+        try need_never_inline_funcs.ensureUnusedCapacity(gpa, rare.never_inline_funcs.count());
+        for (rare.never_inline_funcs.keys()) |fn_nav| {
             need_never_inline_funcs.putAssumeCapacity(fn_nav, {});
         }
     }
@@ -873,7 +1203,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
         while (true) {
             if (index < need_types.count()) {
                 const pool_index = need_types.keys()[index];
-                const rendered = &c.types.items[@backingInt(pool_index)];
+                const rendered = try c.renderedType(pool_index);
                 try mergeNeededCTypes(
                     c,
                     &need_types,
@@ -887,7 +1217,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
 
             if (errunion_index < need_errunion_types.count()) {
                 const payload_pool_index = need_errunion_types.keys()[errunion_index];
-                const rendered = &c.types.items[@backingInt(payload_pool_index)];
+                const rendered = try c.renderedType(payload_pool_index);
                 try mergeNeededCTypes(
                     c,
                     &need_types,
@@ -901,7 +1231,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
 
             if (aligned_index < need_aligned_types.count()) {
                 const pool_index = need_aligned_types.keys()[aligned_index];
-                const rendered = &c.types.items[@backingInt(pool_index)];
+                const rendered = try c.renderedType(pool_index);
                 try mergeNeededCTypes(
                     c,
                     &need_types,
@@ -931,7 +1261,7 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
             aligned_type_strings,
         ) |pool_index, align_mask, *str_out| {
             const ty: Type = .fromInterned(pool_index.val(&c.type_pool));
-            const has_layout = c.types.items[@backingInt(pool_index)].errunion_definition.len > 0;
+            const has_layout = (try c.renderedType(pool_index)).errunion_definition.len > 0;
             for (0..@bitSizeOf(@TypeOf(align_mask))) |bit_index| {
                 switch (@as(u1, @truncate(align_mask >> @intCast(bit_index)))) {
                     0 => continue,
@@ -978,26 +1308,14 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     // an alignment annotation. We couldn't emit the alignment into the UAV's `RenderedDecl` because
     // we couldn't have known the required alignment until now!
 
-    var f: Flush = .{ .all_buffers = .empty, .file_size = 0 };
-    defer f.deinit(gpa);
-
-    // We know exactly what we'll be emitting, so can reserve capacity for all of our buffers!
-
-    try f.all_buffers.ensureUnusedCapacity(gpa, 1 + // Header
-        1 + // Big-int type definitions
-        need_types.count() + // `RenderedType.fwd_decl` (worst-case)
-        need_types.count() + // `RenderedType.definition`
-        need_errunion_types.count() + // `RenderedType.errunion_fwd_decl` (worst-case)
-        need_errunion_types.count() + // `RenderedType.errunion_definition`
-        need_aligned_types.count() + // `aligned_type_strings`
-        1 + // Global assembly
-        c.exported_uavs.count() + // UAV export block
-        c.exported_navs.count() + // NAV export block
-        need_uavs.count() + // UAV forward declarations
-        need_navs.count() + // NAV forward declarations
-        1 + // Lazy declarations
-        need_uavs.count() * 3 + // UAV definitions ("static ", "zig_align(4)", "<definition body>")
-        need_navs.count() * 2); // NAV definitions ("static ", "<definition body>")
+    // The output is written as it is put together, in order (see `Flush`).
+    const file = c.base.file.?;
+    const write_buf = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(write_buf);
+    var fw = file.writer(io, write_buf);
+    var f: Flush = .{ .w = &fw.interface };
+    if (c.spill_len != 0) f.copy_buf = try gpa.alloc(u8, 32 * 1024);
+    defer gpa.free(f.copy_buf);
 
     f.appendBufAssumeCapacity(c.header.get(c));
 
@@ -1032,13 +1350,13 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
         try ft.aligned_status.ensureUnusedCapacity(gpa, need_aligned_types.count());
 
         for (need_types.keys()) |pool_index| {
-            ft.doType(pool_index);
+            try ft.doType(pool_index);
         }
         for (need_errunion_types.keys()) |pool_index| {
-            ft.doErrunionType(pool_index);
+            try ft.doErrunionType(pool_index);
         }
         for (need_aligned_types.keys()) |pool_index| {
-            ft.doAlignedTypeFwd(pool_index);
+            try ft.doAlignedTypeFwd(pool_index);
         }
     }
 
@@ -1065,19 +1383,19 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
 
     // UAV export block
     for (c.exported_uavs.values()) |code| {
-        f.appendBufAssumeCapacity(code.get(c));
+        try f.appendString(gpa, c, code);
     }
 
     // NAV export block
     for (c.exported_navs.values()) |code| {
-        f.appendBufAssumeCapacity(code.get(c));
+        try f.appendString(gpa, c, code);
     }
 
     // UAV forward declarations
     for (need_uavs.keys()) |val| {
         if (c.exported_uavs.contains(val)) continue; // the export was the declaration
         const fwd_decl = c.uavs.getPtr(val).?.fwd_decl;
-        f.appendBufAssumeCapacity(fwd_decl.get(c));
+        try f.appendString(gpa, c, fwd_decl);
     }
 
     // NAV forward declarations
@@ -1087,8 +1405,8 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
             .@"extern" => |e| if (export_names.contains(e.name)) continue,
             else => {},
         }
-        const fwd_decl = c.navs.getPtr(nav).?.fwd_decl;
-        f.appendBufAssumeCapacity(fwd_decl.get(c));
+        const fwd_decl = (try c.renderedNav(nav, &scratch)).fwd_decl;
+        try f.appendString(gpa, c, fwd_decl);
     }
 
     // Lazy declarations
@@ -1183,46 +1501,86 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
             };
             f.appendBufAssumeCapacity(table[overalign.toLog2Units()]);
         }
-        f.appendBufAssumeCapacity(code.get(c));
+        try f.appendString(gpa, c, code);
     }
 
     // NAV definitions
     for (need_navs.keys()) |nav| {
-        const code = c.navs.getPtr(nav).?.code;
+        const code = (try c.renderedNav(nav, &scratch)).code;
         if (code.len == 0) continue;
         if (!c.exported_navs.contains(nav)) {
             const is_extern = ip.indexToKey(ip.getNav(nav).resolved.?.value) == .@"extern";
             f.appendBufAssumeCapacity(if (is_extern) "zig_extern " else "static ");
         }
-        f.appendBufAssumeCapacity(code.get(c));
+        try f.appendString(gpa, c, code);
     }
 
-    // We've collected all of our buffers; it's now time to actually write the file!
-    const file = c.base.file.?;
-    file.setLength(io, f.file_size) catch |err| return diags.fail("failed to allocate file: {t}", .{err});
-    var fw = file.writer(io, &.{});
-    var w = &fw.interface;
-    w.writeVecAll(f.all_buffers.items) catch |err| switch (err) {
-        error.WriteFailed => return diags.fail("failed to write to '{f}': {s}", .{
-            std.fmt.alt(c.base.emit, .formatEscapeChar), @errorName(fw.err.?),
-        }),
+    f.w.flush() catch {
+        f.failed = true;
     };
+    if (f.spill_failed) return diags.fail("failed to read the C spill file '{s}'", .{c.spill_path});
+    if (f.failed) return diags.fail("failed to write to '{f}': {s}", .{
+        std.fmt.alt(c.base.emit, .formatEscapeChar), @errorName(fw.err.?),
+    });
+    file.setLength(io, f.file_size) catch |err| return diags.fail("failed to allocate file: {t}", .{err});
+    // Without incremental updates this was the last flush: the spill file goes now (a release
+    // compiler exits without `deinit`).
+    if (!comp.config.incremental) c.closeSpill();
 }
 
+/// Also called when compile errors skip the flush.
+pub fn closeSpill(c: *C) void {
+    if (!builtin.link_libc or c.spill_path.len == 0) return;
+    if (c.spill_fd >= 0) _ = std.c.close(c.spill_fd);
+    _ = std.c.unlink(c.spill_path);
+    c.spill_fd = -1;
+    c.spill_path = "";
+}
+
+/// The output file, written in order as the pieces are put together, spilled ones copied from
+/// the spill file in between: no list of every piece (which a big compile's flush built after
+/// analysis, on top of everything else), and nothing held longer than it takes to write it. The
+/// first failure stops the writing; `flush` reports it at the end.
 const Flush = struct {
-    /// We collect a list of buffers to write, and write them all at once with pwritev 😎
-    all_buffers: std.ArrayList([]const u8),
-    /// Keeps track of the total bytes of `all_buffers`.
-    file_size: u64,
+    w: *std.Io.Writer,
+    file_size: u64 = 0,
+    failed: bool = false,
+    spill_failed: bool = false,
+    copy_buf: []u8 = &.{},
 
     fn appendBufAssumeCapacity(f: *Flush, buf: []const u8) void {
-        if (buf.len == 0) return;
-        f.all_buffers.appendAssumeCapacity(buf);
+        if (buf.len == 0 or f.failed) return;
+        f.w.writeAll(buf) catch {
+            f.failed = true;
+            return;
+        };
         f.file_size += buf.len;
     }
 
-    fn deinit(f: *Flush, gpa: Allocator) void {
-        f.all_buffers.deinit(gpa);
+    fn appendString(f: *Flush, gpa: Allocator, c: *C, s: String) Allocator.Error!void {
+        _ = gpa;
+        if (!s.isSpilled()) return f.appendBufAssumeCapacity(s.get(c));
+        if (s.len == 0 or f.failed) return;
+        if (builtin.link_libc) {
+            if (std.c.lseek(c.spill_fd, s.start & ~String.spilled, std.c.SEEK.SET) < 0) {
+                f.spill_failed = true;
+                f.failed = true;
+                return;
+            }
+            var left: usize = s.len;
+            while (left != 0) {
+                const n = std.c.read(c.spill_fd, f.copy_buf.ptr, @min(left, f.copy_buf.len));
+                if (n <= 0) {
+                    f.spill_failed = true;
+                    f.failed = true;
+                    return;
+                }
+                const got: usize = @intCast(n);
+                f.appendBufAssumeCapacity(f.copy_buf[0..got]);
+                if (f.failed) return;
+                left -= got;
+            }
+        } else unreachable; // nothing spills without libc
     }
 };
 
@@ -1268,7 +1626,7 @@ pub fn updateExports(
             assert(dg.uavs.count() == 0);
             dg.ctype_deps.deinit(gpa);
         }
-        const code: String = code: {
+        const code: String = c.spillString(code: {
             var aw: std.Io.Writer.Allocating = .fromArrayList(gpa, &c.string_bytes);
             defer c.string_bytes = aw.toArrayList();
             const start = aw.written().len;
@@ -1280,7 +1638,7 @@ pub fn updateExports(
                 .start = @intCast(start),
                 .len = @intCast(aw.written().len - start),
             };
-        };
+        });
         switch (exported) {
             .nav => |nav| try c.exported_navs.put(gpa, nav, code),
             .uav => |uav| try c.exported_uavs.put(gpa, uav, code),
@@ -1294,10 +1652,12 @@ fn mergeNeededCTypes(
     need_errunion_types: *std.array_hash_map.Auto(link.ConstPool.Index, void),
     need_aligned_types: *std.array_hash_map.Auto(link.ConstPool.Index, u64),
     deps: *const CTypeDependencies,
-) Allocator.Error!void {
+) link.Error!void {
     const gpa = c.base.comp.gpa;
 
-    const resolved = deps.get(c);
+    var owned = try deps.getOwned(c);
+    defer owned.deinit(gpa);
+    const resolved = owned.resolved;
 
     try need_types.ensureUnusedCapacity(gpa, resolved.type.len + resolved.type_fwd.len);
     try need_errunion_types.ensureUnusedCapacity(gpa, resolved.errunion_type.len + resolved.errunion_type_fwd.len);
@@ -1347,57 +1707,50 @@ fn addCTypeDependencies(
 ) link.Error!CTypeDependencies {
     const gpa = pt.zcu.comp.gpa;
 
+    inline for (.{ "type", "errunion_type", "type_fwd", "errunion_type_fwd", "aligned_type_fwd" }) |kind| {
+        if (@field(deps, kind).count() > std.math.maxInt(u16)) return error.OutOfMemory;
+    }
     try c.bigint_types.ensureUnusedCapacity(gpa, deps.bigint.count());
     for (deps.bigint.keys()) |bigint| c.bigint_types.putAssumeCapacity(bigint, {});
 
-    const type_start = c.type_dependencies.items.len;
-    const errunion_type_start = type_start + deps.type.count();
-    const type_fwd_start = errunion_type_start + deps.errunion_type.count();
-    const errunion_type_fwd_start = type_fwd_start + deps.type_fwd.count();
-    const aligned_type_fwd_start = errunion_type_fwd_start + deps.errunion_type_fwd.count();
-    try c.type_dependencies.appendNTimes(gpa, undefined, deps.type.count() +
-        deps.errunion_type.count() +
-        deps.type_fwd.count() +
-        deps.errunion_type_fwd.count() +
-        deps.aligned_type_fwd.count());
-
-    const align_mask_start = c.align_dependency_masks.items.len;
-    try c.align_dependency_masks.appendSlice(gpa, deps.aligned_type_fwd.values());
-
-    for (deps.type.keys(), type_start..) |ty, i| {
-        const pool_index = try c.type_pool.get(pt, .{ .c = c }, ty);
-        c.type_dependencies.items[i] = pool_index;
+    // Resolved into a buffer of our own: `type_pool.get` may add types, and with them more
+    // dependencies, before this list is done.
+    const total = deps.type.count() + deps.errunion_type.count() + deps.type_fwd.count() +
+        deps.errunion_type_fwd.count() + deps.aligned_type_fwd.count();
+    const list = try gpa.alloc(link.ConstPool.Index, total);
+    defer gpa.free(list);
+    var i: usize = 0;
+    inline for (.{ "type", "errunion_type", "type_fwd", "errunion_type_fwd", "aligned_type_fwd" }) |kind| {
+        for (@field(deps, kind).keys()) |ty| {
+            list[i] = try c.type_pool.get(pt, .{ .c = c }, ty);
+            i += 1;
+        }
     }
+    const masks = deps.aligned_type_fwd.values();
 
-    for (deps.errunion_type.keys(), errunion_type_start..) |ty, i| {
-        const pool_index = try c.type_pool.get(pt, .{ .c = c }, ty);
-        c.type_dependencies.items[i] = pool_index;
-    }
-
-    for (deps.type_fwd.keys(), type_fwd_start..) |ty, i| {
-        const pool_index = try c.type_pool.get(pt, .{ .c = c }, ty);
-        c.type_dependencies.items[i] = pool_index;
-    }
-
-    for (deps.errunion_type_fwd.keys(), errunion_type_fwd_start..) |ty, i| {
-        const pool_index = try c.type_pool.get(pt, .{ .c = c }, ty);
-        c.type_dependencies.items[i] = pool_index;
-    }
-
-    for (deps.aligned_type_fwd.keys(), aligned_type_fwd_start..) |ty, i| {
-        const pool_index = try c.type_pool.get(pt, .{ .c = c }, ty);
-        c.type_dependencies.items[i] = pool_index;
-    }
-
-    return .{
+    var result: CTypeDependencies = .{
         .len = @intCast(deps.type.count()),
         .errunion_len = @intCast(deps.errunion_type.count()),
         .fwd_len = @intCast(deps.type_fwd.count()),
         .errunion_fwd_len = @intCast(deps.errunion_type_fwd.count()),
         .aligned_fwd_len = @intCast(deps.aligned_type_fwd.count()),
-        .type_start = @intCast(type_start),
-        .align_mask_start = @intCast(align_mask_start),
+        .type_start = undefined,
+        .align_mask_start = undefined,
     };
+    // With the spill file, the flush reads them back (`getOwned`).
+    if (total != 0) spill: {
+        const types_at = c.spillBytes(&.{std.mem.sliceAsBytes(list)}) orelse break :spill;
+        const masks_at: u32 = if (masks.len == 0) 0 else (c.spillBytes(&.{std.mem.sliceAsBytes(masks)}) orelse break :spill).start & ~String.spilled;
+        result.type_start = types_at.start & ~String.spilled;
+        result.align_mask_start = masks_at;
+        result.spilled = true;
+        return result;
+    }
+    result.type_start = @intCast(c.type_dependencies.items.len);
+    result.align_mask_start = @intCast(c.align_dependency_masks.items.len);
+    try c.type_dependencies.appendSlice(gpa, list);
+    try c.align_dependency_masks.appendSlice(gpa, masks);
+    return result;
 }
 
 fn updateNewUavs(c: *C, pt: Zcu.PerThread, old_uavs_len: usize) link.Error!void {
@@ -1435,89 +1788,93 @@ const FlushTypes = struct {
     errunion_status: std.array_hash_map.Auto(link.ConstPool.Index, bool),
     aligned_status: std.array_hash_map.Auto(link.ConstPool.Index, void),
 
-    fn processDeps(ft: *FlushTypes, deps: *const CTypeDependencies) void {
-        const resolved = deps.get(ft.c);
-        for (resolved.type) |pool_index| ft.doType(pool_index);
-        for (resolved.type_fwd) |pool_index| ft.doTypeFwd(pool_index);
-        for (resolved.errunion_type) |pool_index| ft.doErrunionType(pool_index);
-        for (resolved.errunion_type_fwd) |pool_index| ft.doErrunionTypeFwd(pool_index);
-        for (resolved.aligned_type_fwd) |pool_index| ft.doAlignedTypeFwd(pool_index);
+    fn processDeps(ft: *FlushTypes, deps: *const CTypeDependencies) link.Error!void {
+        var owned = try deps.getOwned(ft.c);
+        defer owned.deinit(ft.c.base.comp.gpa);
+        const resolved = owned.resolved;
+        for (resolved.type) |pool_index| try ft.doType(pool_index);
+        for (resolved.type_fwd) |pool_index| try ft.doTypeFwd(pool_index);
+        for (resolved.errunion_type) |pool_index| try ft.doErrunionType(pool_index);
+        for (resolved.errunion_type_fwd) |pool_index| try ft.doErrunionTypeFwd(pool_index);
+        for (resolved.aligned_type_fwd) |pool_index| try ft.doAlignedTypeFwd(pool_index);
     }
-    fn processDepsAsFwd(ft: *FlushTypes, deps: *const CTypeDependencies) void {
-        const resolved = deps.get(ft.c);
-        for (resolved.type) |pool_index| ft.doTypeFwd(pool_index);
-        for (resolved.type_fwd) |pool_index| ft.doTypeFwd(pool_index);
-        for (resolved.errunion_type) |pool_index| ft.doErrunionTypeFwd(pool_index);
-        for (resolved.errunion_type_fwd) |pool_index| ft.doErrunionTypeFwd(pool_index);
-        for (resolved.aligned_type_fwd) |pool_index| ft.doAlignedTypeFwd(pool_index);
+    fn processDepsAsFwd(ft: *FlushTypes, deps: *const CTypeDependencies) link.Error!void {
+        var owned = try deps.getOwned(ft.c);
+        defer owned.deinit(ft.c.base.comp.gpa);
+        const resolved = owned.resolved;
+        for (resolved.type) |pool_index| try ft.doTypeFwd(pool_index);
+        for (resolved.type_fwd) |pool_index| try ft.doTypeFwd(pool_index);
+        for (resolved.errunion_type) |pool_index| try ft.doErrunionTypeFwd(pool_index);
+        for (resolved.errunion_type_fwd) |pool_index| try ft.doErrunionTypeFwd(pool_index);
+        for (resolved.aligned_type_fwd) |pool_index| try ft.doAlignedTypeFwd(pool_index);
     }
 
-    fn doAlignedTypeFwd(ft: *FlushTypes, pool_index: link.ConstPool.Index) void {
+    fn doAlignedTypeFwd(ft: *FlushTypes, pool_index: link.ConstPool.Index) link.Error!void {
         const c = ft.c;
         if (ft.aligned_status.contains(pool_index)) return;
         if (ft.aligned_types.getIndex(pool_index)) |i| {
-            const rendered = &c.types.items[@backingInt(pool_index)];
-            ft.processDepsAsFwd(&rendered.deps);
+            const rendered = try c.renderedType(pool_index);
+            try ft.processDepsAsFwd(&rendered.deps);
             ft.f.appendBufAssumeCapacity(ft.aligned_type_strings[i]);
         }
         ft.aligned_status.putAssumeCapacity(pool_index, {});
     }
-    fn doTypeFwd(ft: *FlushTypes, pool_index: link.ConstPool.Index) void {
+    fn doTypeFwd(ft: *FlushTypes, pool_index: link.ConstPool.Index) link.Error!void {
         const c = ft.c;
         if (ft.status.contains(pool_index)) return;
-        const rendered = &c.types.items[@backingInt(pool_index)];
+        const rendered = try c.renderedType(pool_index);
         if (rendered.fwd_decl.len > 0) {
-            ft.f.appendBufAssumeCapacity(rendered.fwd_decl.get(c));
+            try ft.f.appendString(c.base.comp.gpa, c, rendered.fwd_decl);
             ft.status.putAssumeCapacityNoClobber(pool_index, false);
         } else {
-            ft.processDepsAsFwd(&rendered.definition_deps);
+            try ft.processDepsAsFwd(&rendered.definition_deps);
             const gop = ft.status.getOrPutAssumeCapacity(pool_index);
             if (!gop.found_existing) {
                 gop.value_ptr.* = false;
-                ft.f.appendBufAssumeCapacity(rendered.definition.get(c));
+                try ft.f.appendString(c.base.comp.gpa, c, rendered.definition);
             }
         }
     }
-    fn doType(ft: *FlushTypes, pool_index: link.ConstPool.Index) void {
+    fn doType(ft: *FlushTypes, pool_index: link.ConstPool.Index) link.Error!void {
         const c = ft.c;
         if (ft.status.get(pool_index)) |completed| {
             if (completed) return;
         }
-        const rendered = &c.types.items[@backingInt(pool_index)];
-        ft.processDeps(&rendered.definition_deps);
+        const rendered = try c.renderedType(pool_index);
+        try ft.processDeps(&rendered.definition_deps);
         if (rendered.fwd_decl.len == 0 and ft.status.contains(pool_index)) {
             // `doTypeFwd` already rendered the defintion, we just had to complete the type by
             // fully resolving its dependencies.
         } else if (rendered.definition.len > 0) {
-            ft.f.appendBufAssumeCapacity(rendered.definition.get(c));
+            try ft.f.appendString(c.base.comp.gpa, c, rendered.definition);
         } else if (!ft.status.contains(pool_index)) {
             // The type will never be completed, but it must be forward declared to avoid it being
             // declared in the wrong scope.
-            ft.f.appendBufAssumeCapacity(rendered.fwd_decl.get(c));
+            try ft.f.appendString(c.base.comp.gpa, c, rendered.fwd_decl);
         }
         ft.status.putAssumeCapacity(pool_index, true);
     }
-    fn doErrunionTypeFwd(ft: *FlushTypes, pool_index: link.ConstPool.Index) void {
+    fn doErrunionTypeFwd(ft: *FlushTypes, pool_index: link.ConstPool.Index) link.Error!void {
         const c = ft.c;
         const gop = ft.errunion_status.getOrPutAssumeCapacity(pool_index);
         if (gop.found_existing) return;
-        const rendered = &c.types.items[@backingInt(pool_index)];
-        ft.f.appendBufAssumeCapacity(rendered.errunion_fwd_decl.get(c));
+        const rendered = try c.renderedType(pool_index);
+        try ft.f.appendString(c.base.comp.gpa, c, rendered.errunion_fwd_decl);
         gop.value_ptr.* = false;
     }
-    fn doErrunionType(ft: *FlushTypes, pool_index: link.ConstPool.Index) void {
+    fn doErrunionType(ft: *FlushTypes, pool_index: link.ConstPool.Index) link.Error!void {
         const c = ft.c;
         if (ft.errunion_status.get(pool_index)) |completed| {
             if (completed) return;
         }
-        const rendered = &c.types.items[@backingInt(pool_index)];
-        ft.processDeps(&rendered.deps);
+        const rendered = try c.renderedType(pool_index);
+        try ft.processDeps(&rendered.deps);
         if (rendered.errunion_definition.len > 0) {
-            ft.f.appendBufAssumeCapacity(rendered.errunion_definition.get(c));
+            try ft.f.appendString(c.base.comp.gpa, c, rendered.errunion_definition);
         } else {
             // The error union type will never be completed, but forward declare it to avoid the
             // type being first declared in a different scope.
-            ft.f.appendBufAssumeCapacity(rendered.errunion_fwd_decl.get(c));
+            try ft.f.appendString(c.base.comp.gpa, c, rendered.errunion_fwd_decl);
         }
         ft.errunion_status.putAssumeCapacity(pool_index, true);
     }

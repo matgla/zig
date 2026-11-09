@@ -31,7 +31,14 @@ pub fn hash(opts: @This()) [std.Build.Cache.bin_digest_len]u8 {
             std.hash.autoHash(&h, opts.target.os.versionRange());
             std.hash.autoHash(&h, opts.target.abi);
             std.hash.autoHash(&h, opts.target.ofmt);
-            std.hash.autoHash(&h, opts.target.dynamic_linker);
+            // Only the bytes the path uses: `DynamicLinker.none` is
+            // `.{ .buffer = undefined, .len = 0 }`, and hashing all 255 buffer
+            // bytes made the digest depend on whatever was in that memory. Where
+            // two constructions of the same options leave different garbage
+            // there (YasOS does), `builtin_modules` got an entry per call and
+            // `@import("builtin")` matched none of them.
+            std.hash.autoHash(&h, opts.target.dynamic_linker.len);
+            h.update(opts.target.dynamic_linker.buffer[0..opts.target.dynamic_linker.len]);
         } else {
             std.hash.autoHash(&h, @field(opts, f_name));
         }

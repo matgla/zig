@@ -3238,7 +3238,9 @@ fn updateConstInner(
                         di_nw,
                         if (is_empty) .generated_empty_enum_type else .generated_enum_type,
                     );
-                    try dwarf.strx(di_nw, loaded_enum.fqn.toSlice(ip));
+                    const enum_fqn = try std.fmt.allocPrint(dwarf.lf.comp.gpa, "{f}", .{loaded_enum.fqn.fmt(ip)});
+                    defer dwarf.lf.comp.gpa.free(enum_fqn);
+                    try dwarf.strx(di_nw, enum_fqn);
                 },
             }
             try dwarf.refType(pt, di_nw, .fromInterned(loaded_enum.int_tag_type));

@@ -459,6 +459,60 @@ pub fn fmtIdentUnsolo(ident: []const u8) std.fmt.Alt([]const u8, formatIdentUnso
     return .{ .data = ident };
 }
 
+/// `fmtIdentUnsolo` of a container type's fully qualified name, which need not be one string.
+pub fn fmtIdentUnsoloFqn(fqn: InternPool.ContainerFqn, ip: *const InternPool) std.fmt.Alt(FqnIdent, FqnIdent.format) {
+    return .{ .data = .{ .fqn = fqn, .ip = ip } };
+}
+
+pub const FqnIdent = struct {
+    fqn: InternPool.ContainerFqn,
+    ip: *const InternPool,
+
+    pub fn format(d: FqnIdent, w: *Writer) Writer.Error!void {
+        if (d.fqn.asString()) |s| return formatIdentUnsolo(s.toSlice(d.ip), w);
+        var escaper: IdentEscaper = .{ .out = w };
+        try escaper.writer.print("{f}", .{d.fqn.fmt(d.ip)});
+    }
+
+    /// Writes what it is given as `formatIdentOptions(.., false)` would, a byte at a time.
+    const IdentEscaper = struct {
+        out: *Writer,
+        index: usize = 0,
+        writer: Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+            const e: *IdentEscaper = @alignCast(@fieldParentPtr("writer", w));
+            var n: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                try e.put(bytes);
+                n += bytes.len;
+            }
+            const last = data[data.len - 1];
+            for (0..splat) |_| {
+                try e.put(last);
+                n += last.len;
+            }
+            return n;
+        }
+
+        fn put(e: *IdentEscaper, bytes: []const u8) Writer.Error!void {
+            for (bytes) |c| {
+                switch (c) {
+                    'a'...'z', 'A'...'Z', '_' => try e.out.writeByte(c),
+                    '.', ' ' => try e.out.writeByte('_'),
+                    '0'...'9' => if (e.index == 0) {
+                        try e.out.print("_{x:2}", .{c});
+                    } else {
+                        try e.out.writeByte(c);
+                    },
+                    else => try e.out.print("_{x:2}", .{c}),
+                }
+                e.index += 1;
+            }
+        }
+    };
+};
+
 // Returns true if `formatIdent` would make any edits to ident.
 // This must be kept in sync with `formatIdent`.
 pub fn isMangledIdent(ident: []const u8, solo: bool) bool {
@@ -495,6 +549,12 @@ pub const Function = struct {
     locals: std.ArrayList(LocalType) = .empty,
     /// Which locals are available for reuse, based on Type.
     free_locals_map: LocalsMap = .{},
+    /// While `genBodyResolveState` scopes are open (`undo_depth != 0`): each change to
+    /// `value_map` and `free_locals_map`, undone in reverse when the scope closes. Copying both
+    /// maps at every scope instead held one copy per nesting level -- most of a deeply nested
+    /// function's codegen memory.
+    undo_log: std.ArrayList(Undo) = .empty,
+    undo_depth: u32 = 0,
     /// Locals which will not be freed by Liveness. This is used after a
     /// Function body is lowered in order to make `free_locals_map` have
     /// 100% of the locals within so that it can be used to render the block
@@ -531,9 +591,11 @@ pub const Function = struct {
     }
 
     fn resolveInst(f: *Function, ref: Air.Inst.Ref) !CValue {
+        try f.undoReserve();
         const gop = try f.value_map.getOrPut(ref);
         if (!gop.found_existing) {
             gop.value_ptr.* = .{ .constant = .fromInterned(ref.toInterned().?) };
+            f.undoNote(.{ .value_added = ref });
         }
         return gop.value_ptr.*;
     }
@@ -562,9 +624,11 @@ pub const Function = struct {
     /// Only allocates the local; does not print anything. Will attempt to re-use locals, so should
     /// not be used for persistent locals (i.e. those in `allocs`).
     fn allocAlignedLocal(f: *Function, inst: ?Air.Inst.Index, local_type: LocalType) !CValue {
+        try f.undoReserve();
         const result: CValue = result: {
             if (f.free_locals_map.getPtr(local_type)) |locals_list| {
                 if (locals_list.pop()) |local_entry| {
+                    f.undoNote(.{ .local_reused = .{ .type = local_type, .local = local_entry.key } });
                     break :result .{ .new_local = local_entry.key };
                 }
             }
@@ -656,11 +720,50 @@ pub const Function = struct {
         return f.dg.fmtIntLiteralHex(val, .other);
     }
 
+    const Undo = union(enum) {
+        value_added: Air.Inst.Ref,
+        value_removed: struct { ref: Air.Inst.Ref, value: CValue },
+        /// A key appended to `free_locals_map`.
+        local_type_added,
+        /// A local appended to the list of its type.
+        local_freed: LocalType,
+        /// The last local of a type's list, taken for reuse.
+        local_reused: struct { type: LocalType, local: LocalIndex },
+    };
+
+    /// Room to log one change: call before making it.
+    fn undoReserve(f: *Function) Allocator.Error!void {
+        if (f.undo_depth != 0) try f.undo_log.ensureUnusedCapacity(f.dg.gpa, 2);
+    }
+
+    fn undoNote(f: *Function, u: Undo) void {
+        if (f.undo_depth != 0) f.undo_log.appendAssumeCapacity(u);
+    }
+
+    /// Undoes the changes logged since `mark`, latest first.
+    fn undoTo(f: *Function, mark: usize) Allocator.Error!void {
+        const gpa = f.dg.gpa;
+        while (f.undo_log.items.len > mark) {
+            switch (f.undo_log.pop().?) {
+                .value_added => |ref| assert(f.value_map.remove(ref)),
+                .value_removed => |r| try f.value_map.putNoClobber(r.ref, r.value),
+                .local_type_added => {
+                    var kv = f.free_locals_map.pop().?;
+                    assert(kv.value.count() == 0);
+                    kv.value.deinit(gpa);
+                },
+                .local_freed => |ty| _ = f.free_locals_map.getPtr(ty).?.pop().?,
+                .local_reused => |r| try f.free_locals_map.getPtr(r.type).?.putNoClobber(gpa, r.local, {}),
+            }
+        }
+    }
+
     pub fn deinit(f: *Function) void {
         const gpa = f.dg.gpa;
         f.allocs.deinit(gpa);
         f.locals.deinit(gpa);
         deinitFreeLocalsMap(gpa, &f.free_locals_map);
+        f.undo_log.deinit(gpa);
         f.blocks.deinit(gpa);
         f.value_map.deinit();
         f.need_tag_name_funcs.deinit(gpa);
@@ -1487,7 +1590,10 @@ pub const DeclGen = struct {
                     .small => |s| {
                         const int = ty.intInfo(zcu);
                         var buf: [std.math.big.int.calcTwosCompLimbCount(128)]std.math.big.Limb = undefined;
-                        var bigint: std.math.big.int.Mutable = .init(&buf, undefPattern(u128));
+                        // Without runtime safety nothing may read an undefined value, so it
+                        // renders as 0: the fill pattern costs a wide immediate on every store
+                        // (0xAAAAAAAA is `mvn #0x55555555` on Thumb-2) where 0 is `movs #0`.
+                        var bigint: std.math.big.int.Mutable = .init(&buf, if (safety_on) undefPattern(u128) else 0);
                         bigint.truncate(bigint.toConst(), int.signedness, int.bits);
                         const fmt_undef: FormatInt128 = .{
                             .target = zcu.getTarget(),
@@ -1501,7 +1607,7 @@ pub const DeclGen = struct {
                     },
                     .big => |big| {
                         var buf: [std.math.big.int.calcTwosCompLimbCount(128)]std.math.big.Limb = undefined;
-                        var limb_bigint: std.math.big.int.Mutable = .init(&buf, undefPattern(u128));
+                        var limb_bigint: std.math.big.int.Mutable = .init(&buf, if (safety_on) undefPattern(u128) else 0);
                         limb_bigint.truncate(limb_bigint.toConst(), .unsigned, big.limb_size.bits());
                         const fmt_undef_limb: FormatInt128 = .{
                             .target = zcu.getTarget(),
@@ -2210,7 +2316,7 @@ pub fn genTagNameFn(
     });
     try w.print("static {s} zig_tagName_{f}__{d}({s} tag) {{\n", .{
         slice_const_u8_sentinel_0_type_name,
-        fmtIdentUnsolo(loaded_enum.fqn.toSlice(ip)),
+        fmtIdentUnsoloFqn(loaded_enum.fqn, ip),
         @backingInt(enum_ty.toIntern()),
         enum_type_name,
     });
@@ -2384,7 +2490,7 @@ pub fn genFunc(f: *Function, fwd_decl_writer: *Writer, header_writer: *Writer) E
         .{ .nav = nav_index },
     );
     try header_writer.writeAll(" {\n ");
-    if (!f.dg.mod.strip) try header_writer.print("/* {f} */\n ", .{nav.fqn.fmt(ip)});
+    if (!f.dg.mod.strip) try header_writer.print("/* {f} */\n ", .{zcu.fmtNavFqn(nav_index)});
 
     f.free_locals_map.clearRetainingCapacity();
 
@@ -2590,12 +2696,16 @@ pub fn genDeclValue(dg: *DeclGen, w: *Writer, options: struct {
         try w.writeAll("zig_threadlocal ");
     }
     try dg.renderTypeAndName(w, ty, options.name, .{ .@"const" = options.@"const" }, .none);
-    try w.writeAll(" = ");
-    try dg.renderValue(w, options.init_val, .static_initializer);
+    // A wholly-undefined mutable global needs no initializer: C zero-initialises it,
+    // which is a valid `undefined`, and it lands in .bss instead of spelling out 0xAA
+    // filler (a 256 KiB `[N]u8 = undefined` otherwise becomes ~1.8 MB of C and .data).
+    if (!(options.init_val.isUndef(zcu) and !options.@"const")) {
+        try w.writeAll(" = ");
+        try dg.renderValue(w, options.init_val, .static_initializer);
+    }
     try w.writeByte(';');
     if (dg.owner_nav.unwrap()) |nav_index| {
-        const ip = &zcu.intern_pool;
-        if (!dg.mod.strip) try w.print(" /* {f} */", .{ip.getNav(nav_index).fqn.fmt(ip)});
+        if (!dg.mod.strip) try w.print(" /* {f} */", .{zcu.fmtNavFqn(nav_index)});
     }
     try w.writeByte('\n');
 }
@@ -2722,13 +2832,10 @@ fn genBodyResolveState(f: *Function, inst: Air.Inst.Index, leading_deaths: []con
 
     // TODO: we can probably avoid the copies in some other common cases too.
 
-    const gpa = f.dg.gpa;
-
-    // Save the original value_map and free_locals_map so that we can restore them after the body.
-    var old_value_map = try f.value_map.clone();
-    defer old_value_map.deinit();
-    var old_free_locals = try cloneFreeLocalsMap(gpa, &f.free_locals_map);
-    defer deinitFreeLocalsMap(gpa, &old_free_locals);
+    // Log the changes to value_map and free_locals_map so that we can undo them after the body.
+    const undo_mark = f.undo_log.items.len;
+    f.undo_depth += 1;
+    errdefer f.undo_depth -= 1;
 
     // Remember how many locals there were before entering the body so that we can free any that
     // were newly introduced. Any new locals must necessarily be logically free after the then
@@ -2745,10 +2852,8 @@ fn genBodyResolveState(f: *Function, inst: Air.Inst.Index, leading_deaths: []con
         try genBody(f, body);
     }
 
-    f.value_map.deinit();
-    f.value_map = old_value_map.move();
-    deinitFreeLocalsMap(gpa, &f.free_locals_map);
-    f.free_locals_map = old_free_locals.move();
+    try f.undoTo(undo_mark);
+    f.undo_depth -= 1;
 
     // Now, use the lengths we stored earlier to detect any locals the body generated, and free
     // them, unless they were used to store allocs.
@@ -3077,11 +3182,14 @@ fn genBodyInner(f: *Function, body: []const Air.Inst.Index) Error!void {
         if (result_value == .new_local) {
             log.debug("map %{d} to t{d}", .{ inst, result_value.new_local });
         }
+        if (result_value == .none) continue;
+        try f.undoReserve();
         try f.value_map.putNoClobber(inst.toRef(), switch (result_value) {
-            .none => continue,
+            .none => unreachable,
             .new_local => |local_index| .{ .local = local_index },
             else => result_value,
         });
+        f.undoNote(.{ .value_added = inst.toRef() });
     }
     unreachable;
 }
@@ -4194,11 +4302,9 @@ fn airDbgEmptyStmt(f: *Function, _: Air.Inst.Index) !CValue {
 fn airDbgInlineBlock(f: *Function, inst: Air.Inst.Index) !CValue {
     const pt = f.dg.pt;
     const zcu = pt.zcu;
-    const ip = &zcu.intern_pool;
     const block = f.air.unwrapDbgBlock(inst);
-    const owner_nav = ip.getNav(zcu.funcInfo(block.func).owner_nav);
     const w = &f.code.writer;
-    try w.print("/* inline:{f} */", .{owner_nav.fqn.fmt(&zcu.intern_pool)});
+    try w.print("/* inline:{f} */", .{zcu.fmtNavFqn(zcu.funcInfo(block.func).owner_nav)});
     try f.newline();
     return lowerBlock(f, inst, block.body);
 }
@@ -6701,7 +6807,7 @@ fn airTagName(f: *Function, inst: Air.Inst.Index) !CValue {
     try f.writeCValue(w, local, .other);
     try f.need_tag_name_funcs.put(gpa, enum_ty.toIntern(), {});
     try w.print(" = zig_tagName_{f}__{d}(", .{
-        fmtIdentUnsolo(enum_ty.containerTypeName(ip).fqn.toSlice(ip)),
+        fmtIdentUnsoloFqn(enum_ty.containerTypeName(ip).fqn, ip),
         @backingInt(enum_ty.toIntern()),
     });
     try f.writeCValue(w, operand, .other);
@@ -8000,7 +8106,9 @@ fn reap(f: *Function, inst: Air.Inst.Index, operands: []const Air.Inst.Ref) !voi
 
 fn die(f: *Function, inst: Air.Inst.Index, ref: Air.Inst.Ref) !void {
     const ref_inst = ref.toIndex() orelse return;
+    try f.undoReserve();
     const c_value = (f.value_map.fetchRemove(ref) orelse return).value;
+    f.undoNote(.{ .value_removed = .{ .ref = ref, .value = c_value } });
     const local_index = switch (c_value) {
         .new_local, .local => |l| l,
         else => return,
@@ -8024,8 +8132,12 @@ fn freeLocal(f: *Function, inst: ?Air.Inst.Index, local_index: LocalIndex, ref_i
             log.debug("freeing t{d}", .{local_index});
         }
     }
+    try f.undoReserve();
     const gop = try f.free_locals_map.getOrPut(gpa, local);
-    if (!gop.found_existing) gop.value_ptr.* = .{};
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{};
+        f.undoNote(.local_type_added);
+    }
     if (std.debug.runtime_safety) {
         // If this trips, an unfreeable allocation was attempted to be freed.
         assert(!f.allocs.contains(local_index));
@@ -8034,6 +8146,7 @@ fn freeLocal(f: *Function, inst: ?Air.Inst.Index, local_index: LocalIndex, ref_i
     // free_locals map while it already exists in the map, which is not
     // allowed.
     try gop.value_ptr.putNoClobber(gpa, local_index, {});
+    f.undoNote(.{ .local_freed = local });
 }
 
 const BigTomb = struct {
@@ -8056,25 +8169,6 @@ fn iterateBigTomb(f: *Function, inst: Air.Inst.Index) BigTomb {
     };
 }
 
-/// A naive clone of this map would create copies of the ArrayList which is
-/// stored in the values. This function additionally clones the values.
-fn cloneFreeLocalsMap(gpa: Allocator, map: *LocalsMap) !LocalsMap {
-    var cloned = try map.clone(gpa);
-    const values = cloned.values();
-    var i: usize = 0;
-    errdefer {
-        cloned.deinit(gpa);
-        while (i > 0) {
-            i -= 1;
-            values[i].deinit(gpa);
-        }
-    }
-    while (i < values.len) : (i += 1) {
-        values[i] = try values[i].clone(gpa);
-    }
-    return cloned;
-}
-
 fn deinitFreeLocalsMap(gpa: Allocator, map: *LocalsMap) void {
     for (map.values()) |*value| {
         value.deinit(gpa);
@@ -8095,7 +8189,12 @@ fn renderNavName(w: *Writer, nav_index: InternPool.Nav.Index, ip: *const InternP
     } else {
         // MSVC has a limit of 4095 character token length limit, and fmtIdent can (worst case),
         // expand to 3x the length of its input, but let's cut it off at a much shorter limit.
-        const fqn_slice = ip.getNav(nav_index).fqn.toSlice(ip);
+        const zcu: *Zcu = @constCast(@fieldParentPtr("intern_pool", ip));
+        // The name is cut at 100 bytes below; a few more are enough to render.
+        var fqn_buf: [128]u8 = undefined;
+        var fqn_w: std.Io.Writer = .fixed(&fqn_buf);
+        fqn_w.print("{f}", .{zcu.fmtNavFqn(nav_index)}) catch {};
+        const fqn_slice = fqn_w.buffered();
         try w.print("{f}__{d}", .{
             fmtIdentUnsolo(fqn_slice[0..@min(fqn_slice.len, 100)]),
             @backingInt(nav_index),

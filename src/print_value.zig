@@ -479,7 +479,7 @@ pub fn printPtrDerivation(
             .int => |int| {
                 try writer.print("@as({f}, @ptrFromInt(0x{x}))", .{ derivation.fmtType(zcu), int });
             },
-            .nav => |nav| try writer.print("{f}", .{ip.getNav(nav).fqn.fmt(ip)}),
+            .nav => |nav| try writer.print("{f}", .{zcu.fmtNavFqn(nav)}),
             .uav, .comptime_field => |val| {
                 try writer.print("@as({f}, ", .{derivation.elem_ty.fmt(zcu)});
                 if (x.level == 0) {
