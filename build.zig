@@ -925,10 +925,11 @@ fn addCompilerMod(b: *std.Build, options: AddCompilerModOptions) *std.Build.Modu
 fn addCompilerStep(b: *std.Build, options: AddCompilerModOptions) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "zig",
-        // This number should never be raised. If the value is exceeded, then
-        // it is considered a bug in the Zig project that building the
-        // compiler takes more than 8G of memory.
-        .max_rss = 8_000_000_000,
+        // Upstream keeps this at 8G and calls exceeding it a bug. This fork's
+        // additions (ZIR budget, InternPool spill, C backend spill) put the
+        // compile at 8-10 GB, and the check failed CI runs at random (9.02 GB
+        // on yasos's 16 GB runner): 12G here.
+        .max_rss = 12_000_000_000,
         .root_module = addCompilerMod(b, options),
     });
     exe.stack_size = stack_size;
