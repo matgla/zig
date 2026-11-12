@@ -364,10 +364,17 @@ pub const page_allocator: Allocator = if (@hasDecl(root, "os") and
 else if (builtin.target.cpu.arch.isWasm()) .{
     .ptr = undefined,
     .vtable = &WasmAllocator.vtable,
-} else .{
+} else if (is_yasos)
+    // YasOS: its mmap hands out pages of a per-process pool and there is no
+    // auxiliary vector to tell the page size; its malloc is what everything
+    // there allocates with.
+    c_allocator
+else .{
     .ptr = undefined,
     .vtable = &PageAllocator.vtable,
 };
+
+const is_yasos = std.is_yasos;
 
 pub const smp_allocator: Allocator = .{
     .ptr = undefined,

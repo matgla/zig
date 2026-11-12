@@ -24,6 +24,7 @@ const trace = @import("../tracy.zig").trace;
 const Type = @import("../Type.zig");
 const Value = @import("../Value.zig");
 const AnyMir = @import("../codegen.zig").AnyMir;
+const Tcc = @import("Tcc.zig");
 
 base: link.File,
 
@@ -50,6 +51,10 @@ header: String,
 navs: std.array_hash_map.Auto(InternPool.Nav.Index, NavSlot),
 /// The `RenderedDecl`s of `navs` held in memory, by `NavSlot.index`; free ones are `.init`.
 nav_decls: std.ArrayList(RenderedDecl) = .empty,
+/// `-ftcc`: the binary tcc makes from this file (`base.emit` is `<it>.c`), and
+/// the linker script it is linked with.
+tcc_out: ?Path = null,
+tcc_linker_script: ?Path = null,
 nav_decls_free: std.ArrayList(u31) = .empty,
 /// The needs of a function in `navs` that few have, for those that have any: three empty maps in
 /// every `RenderedDecl` were most of its size.
@@ -529,7 +534,14 @@ pub fn createEmpty(
     assert(!use_lld);
     assert(!use_llvm);
 
-    const file = try emit.root_dir.handle.createFile(io, emit.sub_path, .{
+    // `-ftcc`: the C goes next to the binary, which tcc writes at the end of
+    // the flush.
+    const c_emit: Path = if (comp.tcc != null) .{
+        .root_dir = emit.root_dir,
+        .sub_path = try std.fmt.allocPrint(arena, "{s}.c", .{emit.sub_path}),
+    } else emit;
+
+    const file = try c_emit.root_dir.handle.createFile(io, c_emit.sub_path, .{
         // Truncation is done on `flush`.
         .truncate = false,
     });
@@ -537,10 +549,12 @@ pub fn createEmpty(
 
     const c = try arena.create(C);
     c.* = .{
+        .tcc_out = if (comp.tcc != null) emit else null,
+        .tcc_linker_script = options.linker_script,
         .base = .{
             .tag = .c,
             .comp = comp,
-            .emit = emit,
+            .emit = c_emit,
             .gc_sections = options.gc_sections orelse (optimize_mode != .debug and output_mode != .Obj),
             .print_gc_sections = options.print_gc_sections,
             .stack_size = options.stack_size orelse 16777216,
@@ -561,7 +575,7 @@ pub fn createEmpty(
         .exported_uavs = .empty,
     };
     if (builtin.link_libc) {
-        if (std.c.getenv("ZIG_C_SPILL_DIR")) |dir| c.openSpill(arena, std.mem.span(dir));
+        if (Tcc.spillDir()) |dir| c.openSpill(arena, std.mem.span(dir));
     }
     return c;
 }
@@ -1309,6 +1323,10 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     // we couldn't have known the required alignment until now!
 
     // The output is written as it is put together, in order (see `Flush`).
+    // `-ftcc` closed the file after the last flush (see below).
+    if (c.base.file == null) c.base.file = c.base.emit.root_dir.handle.createFile(io, c.base.emit.sub_path, .{
+        .truncate = false,
+    }) catch |err| return diags.fail("failed to reopen '{f}': {t}", .{ std.fmt.alt(c.base.emit, .formatEscapeChar), err });
     const file = c.base.file.?;
     const write_buf = try gpa.alloc(u8, 64 * 1024);
     defer gpa.free(write_buf);
@@ -1526,6 +1544,15 @@ pub fn flush(c: *C, arena: Allocator, tid: Zcu.PerThread.Id, prog_node: std.Prog
     // Without incremental updates this was the last flush: the spill file goes now (a release
     // compiler exits without `deinit`).
     if (!comp.config.incremental) c.closeSpill();
+
+    if (c.tcc_out) |out| {
+        // tcc reads the file by name, and some file systems (YasOS FAT, whose
+        // fsync does nothing) publish its size only at close.  This was the
+        // last write: nothing updates the C file of a tcc compilation again.
+        file.close(io);
+        c.base.file = null;
+        try Tcc.build(comp, arena, &c.base, comp.tcc.?, c.tcc_linker_script, c.base.emit, out);
+    }
 }
 
 /// Also called when compile errors skip the flush.

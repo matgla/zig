@@ -16,10 +16,30 @@ const Serialize = std.Build.Serialize;
 pub const root = @import("@build");
 pub const dependencies = @import("@dependencies");
 
+/// YasOS (yasos.zig): Linux through libc on an M-profile core.  The configurer
+/// is compiled on the device for every build.zig, inside 8 MB, so what it does
+/// not need there stays out.
+const yasos = std.is_yasos;
+
 pub const std_options: std.Options = .{
     .side_channels_mitigations = .none,
     .http_disable_tls = true,
+    .networking = !yasos,
+    .array_hash_map_single_index_width = yasos,
 };
+
+/// The device compiler targets only ARM.
+pub const std_options_cpu_families: ?[]const std.Target.Cpu.Arch.Family = if (yasos) &.{.arm} else null;
+
+/// The target this process runs on.  On YasOS that is what it was compiled for:
+/// there is nothing to detect, and detection is ~1 MB of its C.  A -ftcc
+/// compilation sees `ofmt == .c`; programs built for this host are real objects.
+fn hostTarget(io: Io) !std.Target {
+    if (!yasos) return std.zig.system.resolveTargetQuery(io, .{});
+    var target = builtin.target;
+    target.ofmt = .default(target.os.tag, target.cpu.arch);
+    return target;
+}
 
 pub fn main(init: process.Init.Minimal) !void {
     var arena_allocator: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -49,7 +69,7 @@ pub fn main(init: process.Init.Minimal) !void {
         // TODO get this from parent process instead
         .host = .{
             .query = .{},
-            .result = try std.zig.system.resolveTargetQuery(io, .{}),
+            .result = try hostTarget(io),
         },
         .generated_files = .empty,
         .zig_exe = zig_exe,

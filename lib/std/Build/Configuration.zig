@@ -1007,7 +1007,7 @@ pub const Step = extern struct {
             entry: Entry,
             lto: Lto,
             subsystem: Subsystem,
-            _: u2 = 0,
+            use_tcc: DefaultingBool,
         };
 
         pub const Flags4 = packed struct(u32) {

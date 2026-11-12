@@ -415,6 +415,10 @@ pub fn build(b: *std.Build) !void {
         exe_options.addOption([]const []const u8, "cpu_families", names);
     }
     exe_options.addOption([]const []const u8, "zig_lib_search", zig_lib_search);
+    exe_options.addOption(bool, "tcc_default", b.option(bool, "tcc-default", "Compile through C and tcc (-ftcc) wherever the backend would be the self-hosted ARM one") orelse false);
+    exe_options.addOption([]const u8, "tcc_exe", b.option([]const u8, "tcc-exe", "The tcc -ftcc runs when ZIG_TCC is not set (default tcc, through PATH)") orelse "tcc");
+    exe_options.addOption([]const u8, "prebuilt_maker", b.option([]const u8, "prebuilt-maker", "`zig build` runs this maker executable instead of compiling lib/compiler/Maker.zig") orelse "");
+    exe_options.addOption(bool, "yasos_host", b.option(bool, "yasos-host", "The compiler runs on YasOS: native programs link the YasOS libc, run single-threaded and get the YasOS runtime from lib/tcc/yasos") orelse false);
     if (tracy) |tracy_dir| {
         const tracy_mod = b.createModule(.{
             .target = target,

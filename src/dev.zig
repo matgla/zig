@@ -189,6 +189,10 @@ pub const Env = enum {
                 .c_linker,
                 // A device compiler (YasOS) still says which version it is.
                 .version_command,
+                // ...and runs `zig build`: the maker (jitCmd) and its child
+                // compilers (--listen=-).
+                .jit_command,
+                .stdio_listen,
                 => true,
                 else => Env.sema.supports(feature),
             },

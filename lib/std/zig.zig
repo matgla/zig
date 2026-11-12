@@ -1749,6 +1749,9 @@ pub fn resolveGlobalCacheDir(arena: Allocator, environ_map: *const std.process.E
                     return Dir.path.join(arena, &.{ home, ".cache", app_name });
                 }
             }
+            // A YasOS shell need not set HOME (a board's console, a script run over
+            // its UART); /var is the card's ext4 there, or RAM without one.
+            if (std.is_yasos) return "/var/cache/" ++ app_name;
             return error.AppDataDirUnavailable;
         },
     }
@@ -1874,6 +1877,81 @@ pub const BuildExeSubprocessResult = struct {
     path: Cache.Path,
 };
 
+pub const ListenResult = struct {
+    term: std.process.Child.Term,
+    stdout: []u8,
+    stderr: []u8,
+
+    pub fn deinit(r: ListenResult, gpa: Allocator) void {
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
+    }
+};
+
+var listen_files_serial: u32 = 0;
+
+/// Runs a `--listen=-` compiler to completion through files instead of pipes,
+/// sending it `update` and `exit`.  YasOS: a parent that talks to its child over
+/// pipes sits in `poll`, and only a process waiting in `waitpid` can be swapped
+/// out to give the compiler the memory.  Nothing here reads the replies until
+/// the child is gone, so progress and an early look at errors are given up.
+pub fn runListenThroughFiles(
+    gpa: Allocator,
+    io: Io,
+    cache_root: Io.Dir,
+    argv: []const []const u8,
+    environ_map: ?*const std.process.Environ.Map,
+) !ListenResult {
+    // Only to make sure it is there: a failure (YasOS FAT, after a compile that ran out of
+    // memory, fails a stat of it) surfaces below, at the files, if it is real.
+    cache_root.createDirPath(io, "tmp") catch {};
+    listen_files_serial += 1;
+    // pid and a serial alone repeat from boot to boot on a deterministic board.
+    var random: u32 = undefined;
+    io.random(std.mem.asBytes(&random));
+    var names: [3][64]u8 = undefined;
+    var paths: [3][]const u8 = undefined;
+    for (&names, &paths, [_][]const u8{ "in", "out", "err" }) |*buf, *path, suffix| {
+        path.* = try std.fmt.bufPrint(buf, "tmp/listen-{d}-{d}-{x}.{s}", .{ std.c.getpid(), listen_files_serial, random, suffix });
+    }
+    defer for (paths) |path| cache_root.deleteFile(io, path) catch {};
+
+    const requests = [_]Client.Message.Header{
+        .{ .tag = .update, .bytes_len = 0 },
+        .{ .tag = .exit, .bytes_len = 0 },
+    };
+    cache_root.writeFile(io, .{ .sub_path = paths[0], .data = std.mem.sliceAsBytes(&requests) }) catch |e| return listenStep(paths[0], e);
+
+    var child = child: {
+        const in = cache_root.openFile(io, paths[0], .{}) catch |e| return listenStep(paths[0], e);
+        defer in.close(io);
+        const out = cache_root.createFile(io, paths[1], .{}) catch |e| return listenStep(paths[1], e);
+        defer out.close(io);
+        const err = cache_root.createFile(io, paths[2], .{}) catch |e| return listenStep(paths[2], e);
+        defer err.close(io);
+        break :child std.process.spawn(io, .{
+            .argv = argv,
+            .environ_map = environ_map,
+            .stdin = .{ .file = in },
+            .stdout = .{ .file = out },
+            .stderr = .{ .file = err },
+        }) catch |e| return listenStep("spawning", e);
+    };
+    // The files are closed on this side, so a file system that publishes a size
+    // only at close (YasOS FAT) shows them whole once the child has exited.
+    const term = child.wait(io) catch |e| return listenStep("waiting", e);
+
+    const stdout = cache_root.readFileAlloc(io, paths[1], gpa, .unlimited) catch |e| return listenStep(paths[1], e);
+    errdefer gpa.free(stdout);
+    const stderr = cache_root.readFileAlloc(io, paths[2], gpa, .unlimited) catch |e| return listenStep(paths[2], e);
+    return .{ .term = term, .stdout = stdout, .stderr = stderr };
+}
+
+fn listenStep(what: []const u8, err: anytype) @TypeOf(err) {
+    log.err("running a compiler through files: {s}: {t}", .{ what, err });
+    return err;
+}
+
 /// Assumes `argv` has `--listen=-` in it and the child process is `zig build-exe`.
 ///
 /// Result path is allocated via gpa.
@@ -1884,7 +1962,21 @@ pub fn buildExeSubprocess(
 ) BuildExeSubprocessError!BuildExeSubprocessResult {
     const cmd: SubprocessCommand = .{ .argv = options.argv };
 
-    var child = std.process.spawn(io, .{
+    // YasOS: the compiler runs to completion and its replies are read afterwards.
+    const listen: ListenResult = if (comptime std.is_yasos)
+        runListenThroughFiles(gpa, io, options.cache_root.handle, options.argv, options.environ_map) catch |err| switch (err) {
+            error.Canceled, error.OutOfMemory => |e| return e,
+            else => |e| {
+                log.err("running command {t}: {f}", .{ e, cmd });
+                return error.AlreadyReported;
+            },
+        }
+    else
+        undefined;
+    defer if (comptime std.is_yasos) listen.deinit(gpa);
+    var listen_reader: Io.Reader = if (comptime std.is_yasos) .fixed(listen.stdout) else undefined;
+
+    var child: std.process.Child = if (comptime std.is_yasos) undefined else std.process.spawn(io, .{
         .argv = options.argv,
         .environ_map = options.environ_map,
         .stdin = .pipe,
@@ -1895,24 +1987,23 @@ pub fn buildExeSubprocess(
         log.err("spawning command {t}: {f}", .{ err, cmd });
         return error.AlreadyReported;
     };
-    defer child.kill(io);
+    defer if (comptime !std.is_yasos) child.kill(io);
 
     var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
     var multi_reader: Io.File.MultiReader = undefined;
-    multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
-    defer multi_reader.deinit();
-    const stdout = multi_reader.reader(0);
-    const stderr = multi_reader.reader(1);
+    if (comptime !std.is_yasos) multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+    defer if (comptime !std.is_yasos) multi_reader.deinit();
+    const stdout = if (comptime std.is_yasos) &listen_reader else multi_reader.reader(0);
 
     var stdin_buffer: [8]u8 = undefined;
-    var stdin_writer = child.stdin.?.writerStreaming(io, &stdin_buffer);
+    var stdin_writer: Io.File.Writer = if (comptime std.is_yasos) undefined else child.stdin.?.writerStreaming(io, &stdin_buffer);
 
     var client: Client = .{
         .in = stdout,
         .out = &stdin_writer.interface,
     };
 
-    (blk: {
+    if (comptime !std.is_yasos) (blk: {
         client.serveMessageHeader(.{ .tag = .update, .bytes_len = 0 }) catch |err| break :blk err;
         client.serveMessageHeader(.{ .tag = .exit, .bytes_len = 0 }) catch |err| break :blk err;
         client.out.flush() catch |err| break :blk err;
@@ -1938,7 +2029,10 @@ pub fn buildExeSubprocess(
     var eos_err: error{EndOfStream}!void = {};
 
     while (true) {
-        const header = client.receiveMessageWithMultiReader(&multi_reader, .none) catch |err| switch (err) {
+        const header = (if (comptime std.is_yasos)
+            client.receiveMessageBuffered()
+        else
+            client.receiveMessageWithMultiReader(&multi_reader, .none)) catch |err| switch (err) {
             error.Timeout => unreachable,
             error.EndOfStream => |e| {
                 if (client.in.bufferedLen() == 0) break;
@@ -2005,7 +2099,7 @@ pub fn buildExeSubprocess(
         }
     }
 
-    const stderr_contents = stderr.buffered();
+    const stderr_contents = if (comptime std.is_yasos) listen.stderr else multi_reader.reader(1).buffered();
     if (stderr_contents.len > 0)
         log.warn("unexpected stderr from {s} command:\n{s}", .{ options.argv[0], stderr_contents });
 
@@ -2014,16 +2108,18 @@ pub fn buildExeSubprocess(
         return error.AlreadyReported;
     };
 
-    // Send EOF to stdin.
-    child.stdin.?.close(io);
-    child.stdin = null;
+    const term = if (comptime std.is_yasos) listen.term else term: {
+        // Send EOF to stdin.
+        child.stdin.?.close(io);
+        child.stdin = null;
 
-    const term = child.wait(io) catch |err| switch (err) {
-        error.Canceled => |e| return e,
-        else => |e| {
-            log.err("{t} waiting for command: {f}", .{ e, cmd });
-            return error.AlreadyReported;
-        },
+        break :term child.wait(io) catch |err| switch (err) {
+            error.Canceled => |e| return e,
+            else => |e| {
+                log.err("{t} waiting for command: {f}", .{ e, cmd });
+                return error.AlreadyReported;
+            },
+        };
     };
 
     if (!term.success()) {

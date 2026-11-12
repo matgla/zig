@@ -36,8 +36,15 @@ const PkgConfig = @import("Maker/PkgConfig.zig");
 const Fetch = @import("Maker/Fetch.zig");
 const Package = @import("Maker/Package.zig");
 
+/// YasOS (yasos.zig): Linux through libc on an M-profile core, no network.
+/// The maker is built there by the C backend and tcc.
+const yasos = std.is_yasos;
+
 pub const std_options: std.Options = .{
     .side_channels_mitigations = .none,
+    // No network on YasOS; the TLS client is the largest code in the maker
+    // (its init alone is past what tcc takes in one function).
+    .http_disable_tls = yasos,
 };
 
 gpa: Allocator,
@@ -85,8 +92,12 @@ var stdio_buffer_allocation: [256]u8 = undefined;
 var stdout_writer_allocation: Io.File.Writer = undefined;
 var debug_maker_leaks: bool = false;
 
-const AvoidableServer = if (builtin.single_threaded) void else Server;
-const AvoidableWebServer = if (builtin.single_threaded) void else WebServer;
+// Single-threaded, `--listen` is refused before a server is made; the type
+// stays so the code that drives one still compiles.
+const AvoidableServer = Server;
+// Single-threaded, `--webui` is refused before a web server is made; the type
+// stays so the code that drives one still compiles.
+const AvoidableWebServer = WebServer;
 
 const is_debug_mode = builtin.mode == .debug;
 const use_safe_allocator = switch (builtin.mode) {
@@ -188,7 +199,13 @@ pub fn main(init: process.Init.Minimal) !void {
     // * `--webui` mode
     // * `--fuzz` mode
     // * A project that has a large, complex build graph.
-    const gpa = if (use_safe_allocator) safe_allocator_instance.allocator() else std.heap.smp_allocator;
+    const gpa = if (use_safe_allocator)
+        safe_allocator_instance.allocator()
+    else if (builtin.single_threaded)
+        // SmpAllocator is for multi-threaded programs only.
+        (if (builtin.link_libc) std.heap.c_allocator else std.heap.page_allocator)
+    else
+        std.heap.smp_allocator;
     defer if (use_safe_allocator) {
         _ = safe_allocator_instance.deinit();
     };
@@ -1175,6 +1192,13 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
         "--name", configurer_exe_name, //
         "-fsingle-threaded", //
     });
+    // YasOS (Linux through libc on an M-profile core): the configurer is
+    // compiled on the device by the C backend and tcc, and in Debug its C is
+    // 1.7x the size (16 MB for a hello world).
+    // tcc itself at -O0: the configurer runs once, for a moment, and its compile
+    // is what every change to a build.zig waits for (13 of ~20 minutes on the
+    // Pico Plus 2 at -Os).
+    if (yasos) try build_configurer_argv.appendSlice(gpa, &.{ "-OReleaseSmall", "--tcc-arg", "-O0" });
 
     // Normally the build runner is compiled for the host target but here is
     // some code to help when debugging edits to the build runner so that you
@@ -1535,7 +1559,10 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
             config_tmp_path.sub_path,
             .{ .read = true, .exclusive = true },
         );
-        defer config_tmp_file.close(io);
+        // Closed as soon as it is loaded: it is renamed into the cache below,
+        // and some file systems (YasOS FAT) do not rename an open file.
+        var config_tmp_open = true;
+        defer if (config_tmp_open) config_tmp_file.close(io);
 
         const term = term: {
             const child_node = options.parent_progress_node.start("Run Configure Script", 0);
@@ -1563,6 +1590,8 @@ fn configure(graph: *Graph, options: ConfigureOptions) !ScannedConfig {
         //   fetched, we need to fetch those now and re-run configure.
         var configuration = Configuration.loadFile(arena, io, config_tmp_file) catch |err|
             fatal("failed to load configuration file {f}: {t}", .{ config_tmp_path, err });
+        config_tmp_file.close(io);
+        config_tmp_open = false;
 
         if (configuration.unlazy_deps.len != 0) {
             var any_errors = false;

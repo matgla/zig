@@ -362,10 +362,10 @@ pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
     }
 
     var cpu = switch (query.cpu_model) {
-        .native => detectNativeCpuAndFeatures(io, query_cpu_arch),
+        .native => detectNativeCpuAndFeatures(io, query_cpu_arch) orelse ownMclassCpu(query_cpu_arch),
         .baseline => null,
         .determined_by_arch_os => if (query.cpu_arch == null)
-            detectNativeCpuAndFeatures(io, query_cpu_arch)
+            detectNativeCpuAndFeatures(io, query_cpu_arch) orelse ownMclassCpu(query_cpu_arch)
         else
             null,
         .explicit => |model| model.toCpu(query_cpu_arch),
@@ -516,6 +516,15 @@ fn updateCpuFeatures(
     set.removeFeatureSet(sub_set);
 }
 
+/// A program on an M-profile core (YasOS, no /proc/cpuinfo) cannot ask what the
+/// core is; the CPU it was itself compiled for is the best native answer, and
+/// keeps the M-profile features that baseline Thumb lacks.
+fn ownMclassCpu(cpu_arch: Target.Cpu.Arch) ?Target.Cpu {
+    if (cpu_arch != builtin.cpu.arch or !(cpu_arch.isArm() or cpu_arch.isThumb())) return null;
+    if (!Target.arm.featureSetHas(builtin.cpu.features, .mclass)) return null;
+    return builtin.cpu;
+}
+
 fn detectNativeCpuAndFeatures(io: Io, cpu_arch: Target.Cpu.Arch) ?Target.Cpu {
     const family = builtin.target.cpu.arch.family();
     assert(cpu_arch.family() == family);
@@ -527,7 +536,7 @@ fn detectNativeCpuAndFeatures(io: Io, cpu_arch: Target.Cpu.Arch) ?Target.Cpu {
 
     switch (builtin.os.tag) {
         .freebsd => return freebsd.detectNativeCpuAndFeatures(),
-        .linux => return linux.detectNativeCpuAndFeatures(io),
+        .linux => return if (comptime std.is_yasos) null else linux.detectNativeCpuAndFeatures(io),
         .macos => return darwin.macos.detectNativeCpuAndFeatures(),
         .netbsd => return netbsd.detectNativeCpuAndFeatures(),
         .openbsd => return openbsd.detectNativeCpuAndFeatures(),
@@ -939,6 +948,12 @@ fn glibcVerFromSoFile(file_reader: *Io.File.Reader) !std.SemanticVersion {
 /// file recursively. If that does not provide the answer, then the function falls back to
 /// defaults.
 fn detectAbiAndDynamicLinker(io: Io, cpu: Target.Cpu, os: Target.Os, query: Target.Query) !Target {
+    if (comptime std.is_yasos) {
+        // No ELF files to inspect: a native ABI is the one this was built for.
+        var q = query;
+        if (q.abi == null) q.abi = builtin.abi;
+        return defaultAbiAndDynamicLinker(cpu, os, q);
+    }
     const native_os_uses_elf = comptime Target.ObjectFormat.default(builtin.target.os.tag, builtin.target.cpu.arch) == .elf;
     const native_ld_needs_abi = comptime Target.DynamicLinker.kind(builtin.target.os.tag) == .arch_os_abi;
     if (!native_os_uses_elf or !native_ld_needs_abi or query.os_tag != null or query.abi != null) {

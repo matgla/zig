@@ -379,18 +379,27 @@ fn ChaChaNonVecImpl(comptime rounds_nb: usize) type {
                 Rp(3, 4, 9, 14),
             };
 
-            comptime var j: usize = 0;
-            inline while (j < rounds_nb) : (j += 2) {
-                inline for (rounds) |r| {
-                    x[r.a] +%= x[r.b];
-                    x[r.d] = math.rotl(u32, x[r.d] ^ x[r.a], @as(u32, 16));
-                    x[r.c] +%= x[r.d];
-                    x[r.b] = math.rotl(u32, x[r.b] ^ x[r.c], @as(u32, 12));
-                    x[r.a] +%= x[r.b];
-                    x[r.d] = math.rotl(u32, x[r.d] ^ x[r.a], @as(u32, 8));
-                    x[r.c] +%= x[r.d];
-                    x[r.b] = math.rotl(u32, x[r.b] ^ x[r.c], @as(u32, 7));
-                }
+            if (builtin.mode == .small) {
+                // The double rounds as a loop: unrolled, they are ten copies of the eight
+                // quarter rounds (2,400 lines when compiled through C).
+                var j: usize = 0;
+                while (j < rounds_nb) : (j += 2) doubleRound(x, rounds);
+            } else {
+                comptime var j: usize = 0;
+                inline while (j < rounds_nb) : (j += 2) doubleRound(x, rounds);
+            }
+        }
+
+        inline fn doubleRound(x: *BlockVec, comptime rounds: anytype) void {
+            inline for (rounds) |r| {
+                x[r.a] +%= x[r.b];
+                x[r.d] = math.rotl(u32, x[r.d] ^ x[r.a], @as(u32, 16));
+                x[r.c] +%= x[r.d];
+                x[r.b] = math.rotl(u32, x[r.b] ^ x[r.c], @as(u32, 12));
+                x[r.a] +%= x[r.b];
+                x[r.d] = math.rotl(u32, x[r.d] ^ x[r.a], @as(u32, 8));
+                x[r.c] +%= x[r.d];
+                x[r.b] = math.rotl(u32, x[r.b] ^ x[r.c], @as(u32, 7));
             }
         }
 
