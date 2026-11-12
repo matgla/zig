@@ -27,6 +27,7 @@ pub const Value = @import("Value.zig");
 pub const Type = @import("Type.zig");
 const Module = @import("Module.zig");
 const link = @import("link.zig");
+const Tcc = @import("link/Tcc.zig");
 const Air = @import("Air.zig");
 const Zir = std.zig.Zir;
 const tracy = @import("tracy.zig");
@@ -1280,6 +1281,8 @@ pub const File = struct {
         digest: Cache.HexDigest,
         /// `Zcu.local_zir_cache` rather than `Zcu.global_zir_cache`.
         local: bool,
+        /// Shipped with the lib (`<zig lib>/zir/`, see `shippedZirDigest`), not the cache.
+        shipped: bool = false,
     };
 
     /// This file's ZIR, reloaded from its ZIR cache file if `Zcu.evictZir` dropped it. Every
@@ -1359,16 +1362,18 @@ pub const File = struct {
         file.unloadZir(gpa);
     }
 
+    // Through `zirAllocator`: a file lowered here has these from the top of memory, and
+    // `ZirTop` hands back to `gpa` what it did not map.
     pub fn unloadTree(file: *File, gpa: Allocator) void {
         if (file.tree) |*tree| {
-            tree.deinit(gpa);
+            tree.deinit(zirAllocator(gpa));
             file.tree = null;
         }
     }
 
     pub fn unloadSource(file: *File, gpa: Allocator) void {
         if (file.source) |source| {
-            gpa.free(source);
+            zirAllocator(gpa).free(source);
             file.source = null;
         }
     }
@@ -3258,7 +3263,7 @@ const ZirTop = struct {
 /// just grows as usual.
 fn readSizeHints() InternPool.SizeHints {
     if (!builtin.link_libc or !builtin.single_threaded) return .{};
-    const path = std.c.getenv("ZIG_IP_HINTS") orelse return .{};
+    const path = Tcc.ipHintsPath() orelse return .{};
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
     if (fd < 0) return .{};
     defer _ = std.c.close(fd);
@@ -3270,7 +3275,7 @@ fn readSizeHints() InternPool.SizeHints {
 
 pub fn writeSizeHints(zcu: *Zcu) void {
     if (!builtin.link_libc or !builtin.single_threaded) return;
-    const path = std.c.getenv("ZIG_IP_HINTS") orelse return;
+    const path = Tcc.ipHintsPath() orelse return;
     var buf: [1024]u8 = undefined;
     const text = std.fmt.bufPrint(&buf, "{f}", .{InternPool.SizeHints.ofPool(&zcu.intern_pool)}) catch return;
     const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
@@ -3431,6 +3436,58 @@ pub fn loadZirCache(gpa: Allocator, io: Io, cache_file: Io.File) !Zir {
         error.ReadFailed => return file_reader.err.?,
         else => |e| return e,
     };
+}
+
+/// ZIR of the zig lib's own files, lowered on the PC by the same compiler build and shipped
+/// with the lib in `<zig lib>/zir/`, named by this digest: the file's path in the lib, the
+/// compiler version and the lowering options -- not the backend that compiled the compiler,
+/// which differs between the PC and a device compiler built through C.  A device then never
+/// lowers std itself: parsing its biggest files (Io/Threaded.zig is 834 KB of source and a
+/// 1.3 MB AST) does not fit in the free runs an 8 MB machine without an MMU has mid-compile.
+/// A compiler run with `ZIG_ZIR_EXPORT_DIR` writes the ZIR of every lib file it lowers there.
+pub fn shippedZirDigest(file_path: Compilation.Path, strip_tests: bool, strip_debug: bool) Cache.HexDigest {
+    var h: Cache.HashHelper = .{};
+    file_path.addToHasher(&h.hasher);
+    // Not `version`: a compiler built through C (`-Donly-c`) reports no git describe suffix.
+    // The shipped ZIR is made by the same build of the compiler that ships with it.
+    // Only `hasher.update`, in fixed widths: the PC that makes the ZIR and the 32-bit device
+    // that loads it must agree, and `HashHelper.add`/`addBytes` hash usize lengths (and the
+    // version's fields are usize themselves).
+    var version: [12]u8 = undefined;
+    std.mem.writeInt(u32, version[0..4], @intCast(build_options.semver.major), .little);
+    std.mem.writeInt(u32, version[4..8], @intCast(build_options.semver.minor), .little);
+    std.mem.writeInt(u32, version[8..12], @intCast(build_options.semver.patch), .little);
+    h.hasher.update(&version);
+    h.hasher.update("shipped zir");
+    h.hasher.update(if (strip_tests) "+strip_tests" else "-strip_tests");
+    h.hasher.update(if (strip_debug) "+strip_debug" else "-strip_debug");
+    return h.final();
+}
+
+/// The shipped ZIR named `digest` (see `shippedZirDigest`), or null when the lib has none.
+/// Trusted as part of the installed lib: the cache's size/inode/mtime check does not apply.
+pub fn loadShippedZir(zcu: *const Zcu, digest: *const Cache.HexDigest) ?Zir {
+    const io = zcu.comp.io;
+    var path_buf: [4 + Cache.hex_digest_len]u8 = undefined;
+    const sub_path = std.fmt.bufPrint(&path_buf, "zir/{s}", .{digest}) catch unreachable;
+    const f = zcu.comp.dirs.zig_lib.handle.openFile(io, sub_path, .{}) catch return null;
+    defer f.close(io);
+    return loadZirCache(zirAllocator(zcu.gpa), io, f) catch null;
+}
+
+/// With `ZIG_ZIR_EXPORT_DIR` set: `zir`, lowered from a zig lib file, written there under
+/// `digest` for shipping with the lib.
+pub fn exportShippedZir(zcu: *const Zcu, digest: *const Cache.HexDigest, stat: Io.File.Stat, zir: *const Zir) void {
+    if (!builtin.link_libc) return;
+    const dir_path = std.c.getenv("ZIG_ZIR_EXPORT_DIR") orelse return;
+    const io = zcu.comp.io;
+    var dir = Io.Dir.cwd().createDirPathOpen(io, std.mem.span(dir_path), .{}) catch return;
+    defer dir.close(io);
+    const f = dir.createFile(io, digest, .{}) catch return;
+    defer f.close(io);
+    var w: Io.File.Writer = .init(f, io, &.{});
+    saveZirCache(zcu.gpa, &w, stat, zir) catch return;
+    w.end() catch {};
 }
 
 pub fn loadZirCacheBody(gpa: Allocator, header: Zir.Header, cache_br: *Io.Reader) !Zir {
@@ -4411,7 +4468,7 @@ fn referenceSpillOn(zcu: *Zcu) bool {
     sp.state = .off;
     if (zcu.comp.config.incremental or zcu.all_references.len != 0 or zcu.all_type_references.items.len != 0 or
         zcu.inline_reference_frames.items.len != 0) return false;
-    const dir = std.c.getenv("ZIG_C_SPILL_DIR") orelse return false;
+    const dir = Tcc.spillDir() orelse return false;
     const path = std.fmt.allocPrintSentinel(zcu.gpa, "{s}/zig-refs-{d}.spill", .{ std.mem.span(dir), std.c.getpid() }, 0) catch return false;
     const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) {
@@ -5248,6 +5305,7 @@ fn reloadZir(zcu: *const Zcu, file: *File) void {
     const entry = file.zir_cache orelse unreachable; // never lowered, or not evictable
     const dir = if (entry.local) zcu.local_zir_cache else zcu.global_zir_cache;
     const zir = reload: {
+        if (entry.shipped) break :reload loadShippedZir(zcu, &entry.digest) orelse error.ShippedZirMissing;
         const cache_file = dir.handle.openFile(io, &entry.digest, .{ .lock = .shared }) catch |err| break :reload err;
         defer cache_file.close(io);
         var buffer: [2000]u8 = undefined;
@@ -5353,6 +5411,16 @@ pub fn evictZir(zcu: *Zcu, when: enum { between_units, within_unit }) Allocator.
         }
         loaded -= bytes;
         if (build_options.peak_heap) InternPool.census.zir_evictions += 1;
+    }
+    if (builtin.link_libc and loaded > zcu.zir_budget and std.c.getenv("ZIG_ZIR_TRACE") != null) {
+        var mapped: usize = 0;
+        for (zir_top.maps.items) |m| mapped += m.len;
+        std.debug.print("zir over budget ({t}): {d} loaded, {d} mapped in {d}\n", .{ when, loaded, mapped, zir_top.maps.items.len });
+        for (zcu.import_table.keys()) |file_index| {
+            const file = zcu.fileByIndex(file_index);
+            const zir = file.zir orelse continue;
+            std.debug.print("  {d:>8} pins={d} cache={} status={t} {s}\n", .{ zirBytes(zir), file.zir_pins, file.zir_cache != null, file.status, file.path.sub_path });
+        }
     }
 }
 

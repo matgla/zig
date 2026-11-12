@@ -187,6 +187,11 @@ pub const Options = struct {
     /// Allows disabling networking in std.Io implementations.
     networking: bool = true,
 
+    /// Array hash maps use one index width instead of choosing u8, u16 or u32 by
+    /// capacity. Every map operation is otherwise instantiated three times, which
+    /// is most of a small map-heavy program's code.
+    array_hash_map_single_index_width: bool = false,
+
     /// Whether or not `error.Unexpected` will print its value and a stack trace.
     ///
     /// If this happens the fix is to add the error code to the corresponding
@@ -241,6 +246,14 @@ pub const Options = struct {
         root.std_options_cpu_families
     else
         null;
+};
+
+/// YasOS (yasos.zig): Linux through libc on an M-profile core, without an MMU, an
+/// auxiliary vector or a dynamic linker in Linux's sense.
+pub const is_yasos = blk: {
+    const b = @import("builtin");
+    break :blk b.os.tag == .linux and b.link_libc and b.cpu.arch.isThumb() and
+        Target.arm.featureSetHas(b.cpu.features, .mclass);
 };
 
 // This forces the start.zig file to be imported, and the comptime logic inside that

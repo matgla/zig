@@ -192,6 +192,7 @@ fn lowerZigArgs(
     try addFlag(gpa, zig_args, "llvm", conf_comp.flags2.use_llvm.toBool());
     try addFlag(gpa, zig_args, "lld", conf_comp.flags2.use_lld.toBool());
     try addFlag(gpa, zig_args, "new-linker", conf_comp.flags2.use_new_linker.toBool());
+    try addFlag(gpa, zig_args, "tcc", conf_comp.flags3.use_tcc.toBool());
 
     const root_module = conf_comp.root_module.get(conf);
 

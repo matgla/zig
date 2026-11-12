@@ -25,6 +25,7 @@ const stringToEnum = std.meta.stringToEnum;
 pub const tracy = @import("tracy.zig");
 const Compilation = @import("Compilation.zig");
 const link = @import("link.zig");
+const Tcc = @import("link/Tcc.zig");
 const build_options = @import("build_options");
 const wasi_libc = @import("libs/wasi_libc.zig");
 const target_util = @import("target.zig");
@@ -249,6 +250,7 @@ const PeakTracker = struct {
 };
 
 var peak_tracker: if (track_peak_heap) PeakTracker else void = undefined;
+
 
 extern "c" fn atexit(f: *const fn () callconv(.c) void) c_int;
 
@@ -677,6 +679,9 @@ const compile_usage =
     \\  --error-limit [num]              Set the maximum amount of distinct error values
     \\  -fllvm                           Force using LLVM as the codegen backend
     \\  -fno-llvm                        Prevent using LLVM as the codegen backend
+    \\  -ftcc                            C backend, then tcc compiles and links the binary
+    \\  -fno-tcc                         Do not go through tcc
+    \\  --tcc-arg [arg]                  Pass an option to tcc (with -ftcc)
     \\  -flibllvm                        Force using the LLVM API in the codegen backend
     \\  -fno-libllvm                     Prevent using the LLVM API in the codegen backend
     \\  -fclang                          Force using Clang as the C/C++ compilation backend
@@ -1682,6 +1687,12 @@ fn buildOutputType(
                         mod_opts.fuzz = true;
                     } else if (mem.eql(u8, arg, "-fno-fuzz")) {
                         mod_opts.fuzz = false;
+                    } else if (mem.eql(u8, arg, "-ftcc")) {
+                        create_module.tcc_explicit = true;
+                    } else if (mem.eql(u8, arg, "-fno-tcc")) {
+                        create_module.tcc_explicit = false;
+                    } else if (mem.eql(u8, arg, "--tcc-arg")) {
+                        try create_module.tcc_args.append(arena, args_iter.nextOrFatal());
                     } else if (mem.eql(u8, arg, "-fllvm")) {
                         create_module.opts.use_llvm = true;
                     } else if (mem.eql(u8, arg, "-fno-llvm")) {
@@ -3579,7 +3590,7 @@ fn buildOutputType(
                     .root_name = root_name,
                     .cpu_arch = target.cpu.arch,
                     .os_tag = target.os.tag,
-                    .ofmt = target.ofmt,
+                    .ofmt = if (create_module.tcc) |t| t.ofmt else target.ofmt,
                     .abi = target.abi,
                     .output_mode = create_module.resolved_options.output_mode,
                     .link_mode = create_module.resolved_options.link_mode,
@@ -3743,6 +3754,8 @@ fn buildOutputType(
     try create_module.rpath_list.appendSlice(arena, rpath_dedup.keys());
 
     var create_diag: Compilation.CreateDiagnostic = undefined;
+    Tcc.lowMemoryDefaults(arena, io, &dirs, root_name);
+
     const comp = Compilation.create(gpa, arena, io, &create_diag, .{
         .dirs = dirs,
         .thread_limit = thread_limit,
@@ -3751,6 +3764,7 @@ fn buildOutputType(
             else => self_exe_path,
         },
         .config = create_module.resolved_options,
+        .tcc = create_module.tcc,
         .root_name = root_name,
         .sysroot = create_module.sysroot,
         .main_mod = main_mod,
@@ -4123,6 +4137,13 @@ const CreateModule = struct {
     rpath_list: std.ArrayList([]const u8),
     each_lib_rpath: ?bool,
     libc_paths_file: ?[]const u8,
+    /// `-ftcc` / `-fno-tcc`; null leaves it to `Tcc.wanted`.
+    tcc_explicit: ?bool = null,
+    /// `--tcc-arg` values.
+    tcc_args: std.ArrayList([]const u8) = .empty,
+    /// Set by `createModule` for the root module when the compilation goes
+    /// through tcc (its target then has `ofmt == .c`).
+    tcc: ?Tcc.Config = null,
 };
 
 fn createModule(
@@ -4203,7 +4224,14 @@ fn createModule(
         }
 
         const target_query = std.zig.parseTargetQueryOrReportFatalError(arena, target_parse_options);
-        const target = std.zig.resolveTargetQueryOrFatal(io, target_query);
+        var target = std.zig.resolveTargetQueryOrFatal(io, target_query);
+        // `-ftcc`: the whole compilation is C backend + tcc.
+        if (parent == null) {
+            if (Tcc.wanted(create_module.tcc_explicit, &target, create_module.opts.use_llvm))
+                create_module.tcc = Tcc.adopt(&target, create_module.tcc_args.items);
+        } else if (create_module.tcc != null) {
+            target.ofmt = .c;
+        }
         break :t .{
             .result = target,
             .is_native_os = target_query.isNativeOs(),
@@ -5150,15 +5178,26 @@ fn jitCmdInner(
     }
 
     const target_query: std.Target.Query = .{};
-    const resolved_target: Module.ResolvedTarget = .{
+    var resolved_target: Module.ResolvedTarget = .{
         .result = std.zig.resolveTargetQueryOrFatal(io, target_query),
         .is_native_os = true,
         .is_native_abi = true,
         .is_explicit_dynamic_linker = false,
     };
+    // A compiler whose own target has no backend but C (YasOS) builds its
+    // tools through tcc.
+    const jit_tcc: ?Tcc.Config = if (Tcc.wanted(null, &resolved_target.result, null))
+        Tcc.adopt(&resolved_target.result, &.{})
+    else
+        null;
 
     const self_exe_path = process.executablePathAlloc(io, arena) catch |err|
         fatal("unable to find self exe path: {t}", .{err});
+
+    // A device compiler ships the maker built ahead (`-Dprebuilt-maker`):
+    // compiling it is 44 MB of C.
+    const prebuilt: []const u8 = if (@hasDecl(build_options, "prebuilt_maker") and
+        mem.eql(u8, options.root_src_path, "Maker.zig")) build_options.prebuilt_maker else "";
 
     const optimize_mode: std.lang.Optimize = if (EnvVar.ZIG_DEBUG_CMD.isSet(environ_map))
         .debug
@@ -5198,7 +5237,10 @@ fn jitCmdInner(
 
     // We want to release all the locks before executing the child process, so we make a nice
     // big block here to ensure the cleanup gets run when we extract out our argv.
-    {
+    if (prebuilt.len != 0) {
+        // Relative: inside the zig lib directory (a device keeps it on its card).
+        child_argv.appendAssumeCapacity(if (fs.path.isAbsolute(prebuilt)) prebuilt else try dirs.zig_lib.join(arena, &.{prebuilt}));
+    } else {
         const main_mod_paths: Module.CreateOptions.Paths = .{
             .root = try .fromRoot(arena, dirs, .zig_lib, "compiler"),
             .root_src_path = options.root_src_path,
@@ -5251,6 +5293,7 @@ fn jitCmdInner(
             .dirs = dirs,
             .root_name = options.cmd_name,
             .config = config,
+            .tcc = jit_tcc,
             .root_mod = root_mod,
             .main_mod = root_mod,
             .emit_bin = .yes_cache,

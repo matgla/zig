@@ -738,8 +738,11 @@ fn main(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) cal
         .linux => {
             const at_phdr = std.c.getauxval(elf.AT.PHDR);
             const at_phnum = std.c.getauxval(elf.AT.PHNUM);
-            const phdrs = (@as([*]elf.ElfN.Phdr, @ptrFromInt(at_phdr)))[0..at_phnum];
-            expandStackSize(phdrs);
+            // 0 where the image has no ELF program headers (YasOS loads YAFF).
+            if (at_phdr != 0) {
+                const phdrs = (@as([*]elf.ElfN.Phdr, @ptrFromInt(at_phdr)))[0..at_phnum];
+                expandStackSize(phdrs);
+            }
         },
         .windows => {
             // On Windows, we ignore libc environment and argv and get those

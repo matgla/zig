@@ -145,6 +145,14 @@ pub fn receiveMessageWithMultiReader(
     return header;
 }
 
+/// For replies already complete in memory (`std.zig.runListenThroughFiles`).
+pub fn receiveMessageBuffered(c: *Client) (Io.File.MultiReader.Error || Io.Timeout.Error)!InMessage.Header {
+    if (c.in.bufferedLen() < @sizeOf(InMessage.Header)) return error.EndOfStream;
+    const header = c.in.takeStruct(InMessage.Header, .little) catch unreachable;
+    if (c.in.bufferedLen() < header.bytes_len) return error.EndOfStream;
+    return header;
+}
+
 /// Don't forget to flush!
 pub fn serveMessageHeader(c: *const Client, header: OutMessage.Header) Writer.Error!void {
     try c.out.writeStruct(header, .little);

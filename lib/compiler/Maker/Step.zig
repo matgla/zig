@@ -444,6 +444,8 @@ pub const ZigProcess = struct {
     multi_reader_buffer: Io.File.MultiReader.Buffer(2),
     multi_reader: Io.File.MultiReader,
     progress_ipc_index: ?if (std.Progress.have_ipc) std.Progress.Ipc.Index else noreturn,
+    /// YasOS: the compiler has already run to completion; this is what it said.
+    listen: if (std.is_yasos) std.zig.ListenResult else void,
 
     pub const StreamEnum = enum { stdout, stderr };
 
@@ -452,8 +454,10 @@ pub const ZigProcess = struct {
     }
 
     pub fn deinit(zp: *ZigProcess, io: Io) void {
-        zp.child.kill(io);
-        zp.multi_reader.deinit();
+        if (comptime !std.is_yasos) {
+            zp.child.kill(io);
+            zp.multi_reader.deinit();
+        }
         zp.* = undefined;
     }
 
@@ -491,7 +495,7 @@ pub fn evalZigProcess(
     // If an error occurs, it's happened in this command:
     errdefer s.setFailedCommand(gpa, argv, .{});
 
-    if (s.getZigProcess()) |zp| update: {
+    if (comptime !std.is_yasos) if (s.getZigProcess()) |zp| update: {
         assert(watch);
         if (zp.progress_ipc_index) |ipc_index| prog_node.setIpcIndex(ipc_index);
         zp.progress_ipc_index = null;
@@ -527,7 +531,7 @@ pub fn evalZigProcess(
         }
 
         return result;
-    }
+    };
     assert(argv.len != 0);
 
     try handleChildProcUnsupported(s, maker);
@@ -536,19 +540,27 @@ pub fn evalZigProcess(
     const zp = try gpa.create(ZigProcess);
     defer if (!watch) gpa.destroy(zp);
 
-    zp.child = std.process.spawn(io, .{
-        .argv = argv,
-        .environ_map = &graph.environ_map,
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        .request_resource_usage_statistics = true,
-        .progress_node = prog_node,
-    }) catch |err| return s.fail(maker, "failed to spawn zig compiler {s}: {t}", .{ argv[0], err });
+    if (comptime std.is_yasos) {
+        // No watching there; the maker waits in waitpid, where it can be swapped out.
+        assert(!watch);
+        zp.listen = std.zig.runListenThroughFiles(gpa, io, graph.local_cache_root.handle, argv, &graph.environ_map) catch |err|
+            return s.fail(maker, "failed to run zig compiler {s}: {t}", .{ argv[0], err });
+    } else {
+        zp.child = std.process.spawn(io, .{
+            .argv = argv,
+            .environ_map = &graph.environ_map,
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+            .request_resource_usage_statistics = true,
+            .progress_node = prog_node,
+        }) catch |err| return s.fail(maker, "failed to spawn zig compiler {s}: {t}", .{ argv[0], err });
 
-    zp.multi_reader.init(gpa, io, zp.multi_reader_buffer.toStreams(), &.{
-        zp.child.stdout.?, zp.child.stderr.?,
-    });
+        zp.multi_reader.init(gpa, io, zp.multi_reader_buffer.toStreams(), &.{
+            zp.child.stdout.?, zp.child.stderr.?,
+        });
+    }
+    defer if (comptime std.is_yasos) zp.listen.deinit(gpa);
     if (watch) s.extended.compile.zig_process = zp;
     defer if (!watch) zp.deinit(io);
 
@@ -561,14 +573,17 @@ pub fn evalZigProcess(
     };
 
     if (!watch) {
-        // Send EOF to stdin.
-        zp.child.stdin.?.close(io);
-        zp.child.stdin = null;
+        const term = if (comptime std.is_yasos) zp.listen.term else term: {
+            // Send EOF to stdin.
+            zp.child.stdin.?.close(io);
+            zp.child.stdin = null;
 
-        const term = zp.child.wait(io) catch |err| {
-            return s.fail(maker, "unable to wait for {s}: {t}", .{ argv[0], err });
+            const t = zp.child.wait(io) catch |err| {
+                return s.fail(maker, "unable to wait for {s}: {t}", .{ argv[0], err });
+            };
+            s.result_peak_rss = zp.child.resource_usage_statistics.getMaxRss() orelse 0;
+            break :term t;
         };
-        s.result_peak_rss = zp.child.resource_usage_statistics.getMaxRss() orelse 0;
 
         // Special handling for compile step that is expecting compile errors.
         const conf = &maker.scanned_config.configuration;
@@ -599,19 +614,25 @@ fn zigProcessUpdate(step_index: Configuration.Step.Index, maker: *Maker, zp: *Zi
 
     const start_ts = Io.Clock.awake.now(io);
 
-    try sendMessage(io, zp.child.stdin.?, .update);
-    if (!watch) try sendMessage(io, zp.child.stdin.?, .exit);
+    if (comptime !std.is_yasos) {
+        try sendMessage(io, zp.child.stdin.?, .update);
+        if (!watch) try sendMessage(io, zp.child.stdin.?, .exit);
+    }
+    var listen_reader: Io.Reader = if (comptime std.is_yasos) .fixed(zp.listen.stdout) else undefined;
 
     var result: OptCacheDigest = .{ .bin = null };
     var eos_err: error{EndOfStream}!void = {};
 
     var client: std.zig.Client = .{
-        .in = zp.multi_reader.reader(0),
+        .in = if (comptime std.is_yasos) &listen_reader else zp.multi_reader.reader(0),
         .out = undefined,
     };
 
     while (true) {
-        const header = client.receiveMessageWithMultiReader(&zp.multi_reader, .none) catch |err| switch (err) {
+        const header = (if (comptime std.is_yasos)
+            client.receiveMessageBuffered()
+        else
+            client.receiveMessageWithMultiReader(&zp.multi_reader, .none)) catch |err| switch (err) {
             error.Timeout => unreachable,
             error.EndOfStream => |e| {
                 if (client.in.bufferedLen() == 0) break;
@@ -729,7 +750,7 @@ fn zigProcessUpdate(step_index: Configuration.Step.Index, maker: *Maker, zp: *Zi
 
     s.result_duration_ns = @intCast(start_ts.untilNow(io, .awake).toNanoseconds());
 
-    const stderr_contents = zp.multi_reader.reader(1).buffered();
+    const stderr_contents = if (comptime std.is_yasos) zp.listen.stderr else zp.multi_reader.reader(1).buffered();
     if (stderr_contents.len > 0) {
         try s.result_error_msgs.append(arena, try arena.dupe(u8, stderr_contents));
     }

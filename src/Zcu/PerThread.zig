@@ -656,14 +656,31 @@ pub fn updateFile(
         try cache_file.lock(io, lock);
     };
 
-    if (need_update) {
+    // A zig lib file whose ZIR was shipped with the lib is not lowered here.
+    const shipped_digest: ?Cache.HexDigest = if (file.path.root == .zig_lib and file.getMode() == .zig)
+        Zcu.shippedZirDigest(file.path, strip_tests, strip_debug)
+    else
+        null;
+    const shipped = need_update and if (shipped_digest) |*d| shipped: {
+        file.zir = zcu.loadShippedZir(d) orelse break :shipped false;
+        file.zir_cache = .{ .digest = d.*, .local = false, .shipped = true };
+        log.debug("AstGen shipped ZIR: {f}", .{file.path.fmt(comp)});
+        break :shipped true;
+    } else false;
+
+    if (need_update and !shipped) {
         var cache_file_writer: Io.File.Writer = .init(cache_file, io, &.{});
 
         if (stat.size > std.math.maxInt(u32))
             return error.FileTooBig;
 
-        const source = try gpa.allocSentinel(u8, @intCast(stat.size), 0);
-        defer if (file.source == null) gpa.free(source);
+        // A file being lowered -- its source, tokens, AST and the ZIR made from them -- is
+        // gone again once its ZIR is cached, and for the biggest files in std it is MBs:
+        // under a ZIR budget it comes from the top of memory like the cached ZIR does
+        // (`Zcu.zirAllocator`), apart from what the compile keeps.
+        const lower_gpa = Zcu.zirAllocator(gpa);
+        const source = try lower_gpa.allocSentinel(u8, @intCast(stat.size), 0);
+        defer if (file.source == null) lower_gpa.free(source);
         var source_fr = source_file.reader(io, &.{});
         source_fr.size = stat.size;
         source_fr.interface.readSliceAll(source) catch |err| switch (err) {
@@ -675,7 +692,7 @@ pub fn updateFile(
 
         var timer = comp.startTimer();
         // Any potential AST errors are converted to ZIR errors when we run AstGen/ZonGen.
-        file.tree = try Ast.parse(gpa, source, .{ .mode = file.getMode() });
+        file.tree = try Ast.parse(lower_gpa, source, .{ .mode = file.getMode() });
         if (timer.finish(io)) |ns_parse| {
             comp.mutex.lockUncancelable(io);
             defer comp.mutex.unlock(io);
@@ -685,7 +702,8 @@ pub fn updateFile(
         timer = comp.startTimer();
         switch (file.getMode()) {
             .zig => {
-                file.zir = try AstGen.generateOptions(gpa, file.tree.?, .{ .strip_tests = strip_tests, .strip_debug = strip_debug });
+                file.zir = try AstGen.generateOptions(lower_gpa, file.tree.?, .{ .strip_tests = strip_tests, .strip_debug = strip_debug });
+                if (shipped_digest) |*d| zcu.exportShippedZir(d, stat, &file.zir.?);
                 if (Zcu.saveZirCache(gpa, &cache_file_writer, stat, &file.zir.?)) {
                     file.zir_cache = .{ .digest = hex_digest, .local = want_local_cache };
                 } else |err| switch (err) {

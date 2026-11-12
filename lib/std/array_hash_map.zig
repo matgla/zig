@@ -1558,6 +1558,7 @@ fn capacityIndexType(bit_index: u8) CapacityIndexType {
 }
 
 fn capacityIndexSize(bit_index: u8) usize {
+    if (comptime std.options.array_hash_map_single_index_width) return @sizeOf(Index(u32));
     switch (capacityIndexType(bit_index)) {
         .u8 => return @sizeOf(Index(u8)),
         .u16 => return @sizeOf(Index(u16)),
@@ -1661,7 +1662,8 @@ const IndexHeader = struct {
     }
 
     /// Returns the type used for the index arrays.
-    fn capacityIndexType(header: IndexHeader) CapacityIndexType {
+    inline fn capacityIndexType(header: IndexHeader) CapacityIndexType {
+        if (comptime std.options.array_hash_map_single_index_width) return .u32;
         return hash_map.capacityIndexType(header.bit_index);
     }
 

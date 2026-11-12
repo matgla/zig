@@ -17,6 +17,7 @@ const Value = @import("Value.zig");
 const Type = @import("Type.zig");
 const target_util = @import("target.zig");
 const link = @import("link.zig");
+const Tcc = @import("link/Tcc.zig");
 const tracy = @import("tracy.zig");
 const trace = tracy.trace;
 const build_options = @import("build_options");
@@ -258,6 +259,9 @@ file_system_inputs: ?*std.ArrayList(u8),
 /// This digest will be known after update() is called.
 digest: ?[Cache.bin_digest_len]u8 = null,
 
+/// `-ftcc`: the compilation targets `-ofmt=c` and tcc turns the C into the
+/// binary (`link/Tcc.zig`).
+tcc: ?Tcc.Config,
 /// Non-`null` iff we are emitting a binary.
 /// Does not change for the lifetime of this `Compilation`.
 /// Cwd-relative if `cache_use == .none`. Otherwise, relative to our subdirectory in the cache.
@@ -1607,6 +1611,9 @@ pub const CreateOptions = struct {
     pdb_out_path: ?[]const u8 = null,
     error_limit: ?Zcu.ErrorInt = null,
     global_cc_argv: []const []const u8 = &.{},
+    /// `-ftcc` (see `Compilation.tcc`).  The root module's target has
+    /// `ofmt == .c`; this remembers the object format of the binary.
+    tcc: ?Tcc.Config = null,
 
     /// Tracks all files that can cause the Compilation to be invalidated and need a rebuild.
     file_system_inputs: ?*std.ArrayList(u8) = null,
@@ -1638,7 +1645,8 @@ pub const CreateOptions = struct {
                         .root_name = opts.root_name,
                         .cpu_arch = target.cpu.arch,
                         .os_tag = target.os.tag,
-                        .ofmt = target.ofmt,
+                        // `-ftcc`: the binary is named for its real format.
+                        .ofmt = if (ea == .bin) if (opts.tcc) |t| t.ofmt else target.ofmt else target.ofmt,
                         .abi = target.abi,
                         .output_mode = opts.config.output_mode,
                         .link_mode = opts.config.link_mode,
@@ -1771,7 +1779,8 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             .{ .root_dir = options.dirs.zig_lib },
             target,
             options.root_mod.resolved_target.is_native_abi,
-            link_libc,
+            // `-ftcc`: libc (headers, crt, the library) is tcc's business.
+            link_libc and options.tcc == null,
             options.libc_installation,
             options.environ_map,
         ) catch |err| switch (err) {
@@ -2161,6 +2170,7 @@ pub fn create(gpa: Allocator, arena: Allocator, io: Io, diag: *CreateDiagnostic,
             .parent_whole_cache = options.parent_whole_cache,
             .link_diags = .init(gpa, io),
             .oneshot_prelink_tasks = .empty,
+            .tcc = options.tcc,
             .emit_bin = try options.emit_bin.resolve(arena, &options, .bin),
             .emit_asm = try options.emit_asm.resolve(arena, &options, .@"asm"),
             .emit_implib = try options.emit_implib.resolve(arena, &options, .implib),
@@ -3104,6 +3114,11 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
                     .root_dir = comp.dirs.local_cache,
                     .sub_path = try fs.path.join(arena, &.{ o_sub_path, comp.emit_bin.? }),
                 };
+                // `-ftcc`: the C backend's file is `<bin>.c`; the binary is tcc's.
+                if (comp.tcc != null) if (lf.cast(.c)) |c| {
+                    c.tcc_out = lf.emit;
+                    lf.emit.sub_path = try std.fmt.allocPrint(arena, "{s}.c", .{lf.emit.sub_path});
+                };
                 const result: (link.File.OpenError || error{HotSwapUnavailableOnHostOperatingSystem})!void = switch (need_writable_dance) {
                     .no => {},
                     .lf_only => lf.makeWritable(),
@@ -3425,6 +3440,12 @@ fn addNonIncrementalStuffToCacheManifest(comp: *Compilation, man: *Cache.Manifes
     man.hash.addListOfBytes(comp.windows_libs.keys());
 
     man.hash.addListOfBytes(comp.global_cc_argv);
+
+    man.hash.add(comp.tcc != null);
+    if (comp.tcc) |t| {
+        man.hash.add(t.ofmt);
+        man.hash.addListOfBytes(t.args);
+    }
 
     const opts = comp.cache_use.whole.lf_open_opts;
 

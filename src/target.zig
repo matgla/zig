@@ -1,5 +1,6 @@
 const builtin = @import("builtin");
 const std = @import("std");
+const Tcc = @import("link/Tcc.zig");
 const assert = std.debug.assert;
 
 const dev = @import("dev.zig");
@@ -119,6 +120,8 @@ pub fn defaultSingleThreaded(target: *const std.Target) bool {
         .wasm32, .wasm64 => return true,
         else => {},
     }
+    // A compiler on YasOS builds single-threaded programs for it, as it is one.
+    if (Tcc.yasos_host and target.os.tag == .linux and target.cpu.arch.isThumb()) return true;
     return false;
 }
 

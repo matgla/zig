@@ -233,6 +233,9 @@ pub fn resolve(options: Options) ResolveError!Config {
             break :b true;
         }
         if (options.link_libc) |x| break :b x;
+        // On YasOS every system call goes through its libc; Zig's raw Linux
+        // syscalls would not reach the kernel.
+        if (Tcc.yasos_host and options.resolved_target.is_native_os and target.os.tag == .linux) break :b true;
         if (options.ensure_libc_on_non_freestanding and target.os.tag != .freestanding)
             break :b true;
 
@@ -586,4 +589,5 @@ const std = @import("std");
 const Module = @import("../Module.zig");
 const Config = @This();
 const target_util = @import("../target.zig");
+const Tcc = @import("../link/Tcc.zig");
 const build_options = @import("build_options");

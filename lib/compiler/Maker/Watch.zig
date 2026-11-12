@@ -39,7 +39,8 @@ const Hash = std.hash.Wyhash;
 const Cache = std.Build.Cache;
 
 const Os = switch (builtin.os.tag) {
-    .linux => struct {
+    // Linked with a libc that has no fanotify (YasOS): no watching.
+    .linux => if (builtin.link_libc and !@hasDecl(std.c, "fanotify_init")) void else struct {
         const posix = std.posix;
 
         /// Keyed differently but indexes correspond 1:1 with `dir_table`.

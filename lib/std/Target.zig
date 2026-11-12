@@ -395,7 +395,10 @@ pub const Os = struct {
         /// The default `VersionRange` represents the range that the Zig Standard Library
         /// bases its abstractions on.
         pub fn default(arch: Cpu.Arch, tag: Tag, abi: Abi) VersionRange {
-            return switch (tag) {
+            // On YasOS only Linux (YasOS itself) has versions: the table for every
+            // other OS is the largest single function of a device build script.
+            if (comptime std.is_yasos) if (tag != .linux) return .{ .none = {} };
+            return switch (if (comptime std.is_yasos) Tag.linux else tag) {
                 .freestanding,
                 .other,
 
@@ -2573,6 +2576,7 @@ pub const DynamicLinker = struct {
     /// The responsibility for determining whether `abi` is valid in this case rests with the
     /// caller. `Abi.default()` can be used to pick a best-effort default ABI for such platforms.
     pub fn standard(cpu: Cpu, os: Os.Tag, abi: Abi) DynamicLinker {
+        if (comptime std.is_yasos) return none; // YasOS programs name no interpreter.
         return switch (os) {
             .fuchsia => switch (cpu.arch) {
                 .arm,

@@ -201,6 +201,10 @@ stack_size: ?u64 = null,
 use_llvm: ?bool,
 use_lld: ?bool,
 use_new_linker: ?bool,
+/// `-ftcc`: Zig's C backend writes C and libtcc compiles and links it into the
+/// binary.  `null` leaves it to the compiler (on by default where it was built
+/// with `-Dtcc-default`, for targets with no backend but C).
+use_tcc: ?bool = null,
 
 /// Corresponds to the `-fallow-so-scripts` / `-fno-allow-so-scripts` CLI
 /// flags, overriding the global user setting provided to the `zig build`
